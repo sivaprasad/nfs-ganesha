@@ -229,7 +229,7 @@ fsal_status_t fsal_internal_get_handle(const char *p_fsalpath,	/* IN */
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 #ifdef _VALGRIND_MEMCHECK
-	memset(p_gpfs_handle, 0, sizeof(*p_gpfs_handle));
+	memset(p_handle, 0, sizeof(*p_handle));
 #endif
 
 	harg.handle = p_handle;
@@ -283,7 +283,7 @@ fsal_status_t fsal_internal_get_handle_at(int dfd, const char *p_fsalname,
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 #ifdef _VALGRIND_MEMCHECK
-	memset(p_gpfs_handle, 0, sizeof(*p_gpfs_handle));
+	memset(p_handle, 0, sizeof(*p_handle));
 #endif
 
 	harg.handle = p_handle;
@@ -293,10 +293,6 @@ fsal_status_t fsal_internal_get_handle_at(int dfd, const char *p_fsalname,
 	harg.name = p_fsalname;
 	harg.dfd = dfd;
 	harg.flag = 0;
-
-#ifdef _VALGRIND_MEMCHECK
-	memset(harg.handle->f_handle, 0, harg.handle->handle_size);
-#endif
 
 	LogFullDebug(COMPONENT_FSAL, "Lookup handle at for %d %s", dfd,
 		     p_fsalname);
@@ -341,7 +337,7 @@ fsal_status_t fsal_internal_get_fh(int dirfd,	/* IN  */
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 #ifdef _VALGRIND_MEMCHECK
-	memset(p_gpfs_out_fh, 0, sizeof(*p_gpfs_out_fh));
+	memset(p_out_fh, 0, sizeof(*p_out_fh));
 #endif
 
 	harg.mountdirfd = dirfd;
@@ -352,10 +348,6 @@ fsal_status_t fsal_internal_get_fh(int dirfd,	/* IN  */
 	harg.out_fh->handle_key_size = OPENHANDLE_KEY_LEN;
 	harg.len = strlen(p_fsalname);
 	harg.name = p_fsalname;
-
-#ifdef _VALGRIND_MEMCHECK
-	memset(harg.out_fh, 0, harg.out_fh->handle_size);
-#endif
 
 	LogFullDebug(COMPONENT_FSAL, "Lookup handle for %s", p_fsalname);
 
@@ -587,15 +579,12 @@ fsal_status_t fsal_internal_create(struct fsal_obj_handle *dir_hdl,
 	struct gpfs_filesystem *gpfs_fs;
 	struct gpfs_fsal_obj_handle *gpfs_hdl;
 	int errsv = 0;
-#ifdef _VALGRIND_MEMCHECK
-	gpfsfsal_handle_t *p_handle = (gpfsfsal_handle_t *) p_new_handle;
-#endif
 
 	if (!p_stat_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 #ifdef _VALGRIND_MEMCHECK
-	memset(p_handle, 0, sizeof(*p_handle));
+	memset(p_new_handle, 0, sizeof(*p_new_handle));
 #endif
 
 	gpfs_hdl =
@@ -613,10 +602,6 @@ fsal_status_t fsal_internal_create(struct fsal_obj_handle *dir_hdl,
 	crarg.new_fh->handle_key_size = OPENHANDLE_KEY_LEN;
 	crarg.new_fh->handle_version = OPENHANDLE_VERSION;
 	crarg.buf = buf;
-
-#ifdef _VALGRIND_MEMCHECK
-	memset(crarg.new_fh->f_handle, 0, crarg.new_fh->handle_size);
-#endif
 
 	rc = gpfs_ganesha(OPENHANDLE_CREATE_BY_NAME, &crarg);
 	errsv = errno;
@@ -698,7 +683,7 @@ fsal_status_t fsal_readlink_by_handle(int dirfd,
 	int errsv = 0;
 
 #ifdef _VALGRIND_MEMCHECK
-	memset(__buf, 0, maxlen);
+	memset(__buf, 0, *maxlen);
 #endif
 
 	readlinkarg.mountdirfd = dirfd;
@@ -741,8 +726,7 @@ int fsal_internal_version()
 			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
 		LogDebug(COMPONENT_FSAL, "GPFS get version failed with rc %d",
 			 rc);
-	}
-	else
+	} else
 		LogDebug(COMPONENT_FSAL, "GPFS get version %d", rc);
 
 	return rc;
@@ -896,8 +880,8 @@ fsal_status_t fsal_trucate_by_handle(int dirfd,
  *  fsal_error_is_event:
  *  Indicates if an FSAL error should be posted as an event
  *  \param status(input): The fsal status whom event is to be tested.
- *  \return - TRUE if the error event is to be posted.
- *          - FALSE if the error event is NOT to be posted.
+ *  \return - true if the error event is to be posted.
+ *          - false if the error event is NOT to be posted.
  */
 bool fsal_error_is_event(fsal_status_t status)
 {
@@ -906,10 +890,10 @@ bool fsal_error_is_event(fsal_status_t status)
 
 	case ERR_FSAL_IO:
 	case ERR_FSAL_STALE:
-		return TRUE;
+		return true;
 
 	default:
-		return FALSE;
+		return false;
 	}
 }
 
@@ -917,8 +901,8 @@ bool fsal_error_is_event(fsal_status_t status)
  *  fsal_error_is_info:
  *  Indicates if an FSAL error should be posted as an INFO level debug msg.
  *  \param status(input): The fsal status whom event is to be tested.
- *  \return - TRUE if the error event is to be posted.
- *          - FALSE if the error event is NOT to be posted.
+ *  \return - true if the error event is to be posted.
+ *          - false if the error event is NOT to be posted.
  */
 bool fsal_error_is_info(fsal_status_t status)
 {
@@ -940,9 +924,9 @@ bool fsal_error_is_info(fsal_status_t status)
 	case ERR_FSAL_DEADLOCK:
 	case ERR_FSAL_INTERRUPT:
 	case ERR_FSAL_SERVERFAULT:
-		return TRUE;
+		return true;
 
 	default:
-		return FALSE;
+		return false;
 	}
 }

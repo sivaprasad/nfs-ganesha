@@ -51,9 +51,9 @@
 #include "nfs_core.h"
 #include "log.h"
 #include "avltree.h"
-#include "ganesha_types.h"
+#include "gsh_types.h"
 #ifdef USE_DBUS
-#include "ganesha_dbus.h"
+#include "gsh_dbus.h"
 #endif
 #include "export_mgr.h"
 #include "client_mgr.h"
@@ -61,17 +61,21 @@
 #include "server_stats.h"
 #include "abstract_atomic.h"
 #include "gsh_intrinsic.h"
-#include "sal_functions.h"
+#include "nfs_exports.h"
+#include "nfs_proto_functions.h"
+#include "pnfs_utils.h"
 
 /**
  * @brief Exports are stored in an AVL tree with front-end cache.
  *
+ * @note  number of cache slots should be prime.
  */
+#define EXPORT_BY_ID_CACHE_SIZE 769
+
 struct export_by_id {
 	pthread_rwlock_t lock;
 	struct avltree t;
-	struct avltree_node **cache;
-	uint32_t cache_sz;
+	struct avltree_node *cache[EXPORT_BY_ID_CACHE_SIZE];
 };
 
 static struct export_by_id export_by_id;
@@ -150,14 +154,37 @@ struct gsh_export *export_take_unexport_work(void)
  * This function computes a hash slot, taking an address modulo the
  * number of cache slotes (which should be prime).
  *
- * @param wt [in] The table
- * @param ptr [in] Entry address
+ * @param k [in] Entry index value
  *
  * @return The computed offset.
  */
-static inline uint32_t eid_cache_offsetof(struct export_by_id *eid, uint64_t k)
+static inline uint16_t eid_cache_offsetof(uint16_t k)
 {
-	return k % eid->cache_sz;
+	return k % EXPORT_BY_ID_CACHE_SIZE;
+}
+
+/**
+ * @brief Revert export_commit()
+ *
+ * @param export [in] the export just inserted/committed
+ */
+void export_revert(struct gsh_export *export)
+{
+	struct avltree_node *cnode;
+	void **cache_slot = (void **)
+	     &(export_by_id.cache[eid_cache_offsetof(export->export_id)]);
+
+	PTHREAD_RWLOCK_wrlock(&export_by_id.lock);
+
+	cnode = (struct avltree_node *)atomic_fetch_voidptr(cache_slot);
+	if (&export->node_k == cnode)
+		atomic_store_voidptr(cache_slot, NULL);
+	avltree_remove(&export->node_k, &export_by_id.t);
+	glist_del(&export->exp_list);
+	glist_del(&export->exp_work);
+
+	PTHREAD_RWLOCK_unlock(&export_by_id.lock);
+	put_gsh_export(export); /* Release sentinel ref */
 }
 
 /**
@@ -189,12 +216,23 @@ static int export_id_cmpf(const struct avltree_node *lhs,
 struct gsh_export *alloc_export(void)
 {
 	struct export_stats *export_st;
+	struct gsh_export *export;
 
 	export_st = gsh_calloc(sizeof(struct export_stats), 1);
 	if (export_st == NULL)
 		return NULL;
 
-	return &export_st->export;
+	export = &export_st->export;
+
+	glist_init(&export->exp_state_list);
+	glist_init(&export->exp_lock_list);
+	glist_init(&export->exp_nlm_share_list);
+	glist_init(&export->mounted_exports_list);
+	glist_init(&export->clients);
+
+	PTHREAD_RWLOCK_init(&export->lock, NULL);
+
+	return export;
 }
 
 /**
@@ -208,9 +246,14 @@ void free_export(struct gsh_export *export)
 {
 	struct export_stats *export_st;
 
+	assert(export->refcnt == 0);
+
+	/* free resources */
 	free_export_resources(export);
 	export_st = container_of(export, struct export_stats, export);
+	server_stats_free(&export_st->st);
 	gsh_free(export_st);
+	PTHREAD_RWLOCK_destroy(&export->lock);
 }
 
 
@@ -228,26 +271,27 @@ void free_export(struct gsh_export *export)
 
 bool insert_gsh_export(struct gsh_export *export)
 {
-	struct avltree_node *node = NULL;
-	void **cache_slot;
-
-	export->refcnt = 1;	/* we will hold a ref starting out... */
+	struct avltree_node *node;
+	void **cache_slot = (void **)
+	    &(export_by_id.cache[eid_cache_offsetof(export->export_id)]);
 
 	PTHREAD_RWLOCK_wrlock(&export_by_id.lock);
 	node = avltree_insert(&export->node_k, &export_by_id.t);
 	if (node) {
+		/* somebody beat us to it */
 		PTHREAD_RWLOCK_unlock(&export_by_id.lock);
-		return false;	/* somebody beat us to it */
+		return false;
 	}
-	pthread_rwlock_init(&export->lock, NULL);
+
+	/* we will hold a ref starting out... */
+	get_gsh_export_ref(export);
+
 	/* update cache */
-	cache_slot = (void **)
-		&(export_by_id.cache[eid_cache_offsetof(&export_by_id,
-							export->export_id)]);
 	atomic_store_voidptr(cache_slot, &export->node_k);
 	glist_add_tail(&exportlist, &export->exp_list);
-	get_gsh_export_ref(export);
+	get_gsh_export_ref(export);		/* == 2 */
 	glist_init(&export->entry_list);
+
 	PTHREAD_RWLOCK_unlock(&export_by_id.lock);
 	return true;
 }
@@ -265,29 +309,25 @@ bool insert_gsh_export(struct gsh_export *export)
  */
 struct gsh_export *get_gsh_export(uint16_t export_id)
 {
-	struct avltree_node *node = NULL;
-	struct gsh_export *exp;
 	struct gsh_export v;
-	void **cache_slot;
+	struct avltree_node *node;
+	struct gsh_export *exp;
+	void **cache_slot = (void **)
+	    &(export_by_id.cache[eid_cache_offsetof(export_id)]);
 
 	v.export_id = export_id;
 	PTHREAD_RWLOCK_rdlock(&export_by_id.lock);
 
 	/* check cache */
-	cache_slot = (void **)
-	    &(export_by_id.cache[eid_cache_offsetof(&export_by_id, export_id)]);
 	node = (struct avltree_node *)atomic_fetch_voidptr(cache_slot);
 	if (node) {
-		if (export_id_cmpf(&v.node_k, node) == 0) {
+		exp = avltree_container_of(node, struct gsh_export, node_k);
+		if (exp->export_id == export_id) {
 			/* got it in 1 */
 			LogDebug(COMPONENT_HASHTABLE_CACHE,
 				 "export_mgr cache hit slot %d",
-				 eid_cache_offsetof(&export_by_id, export_id));
-			exp =
-			    avltree_container_of(node, struct gsh_export,
-						 node_k);
-			if (exp->state == EXPORT_READY)
-				goto out;
+				 eid_cache_offsetof(export_id));
+			goto out;
 		}
 	}
 
@@ -295,13 +335,8 @@ struct gsh_export *get_gsh_export(uint16_t export_id)
 	node = avltree_lookup(&v.node_k, &export_by_id.t);
 	if (node) {
 		exp = avltree_container_of(node, struct gsh_export, node_k);
-		if (exp->state != EXPORT_READY) {
-			PTHREAD_RWLOCK_unlock(&export_by_id.lock);
-			return NULL;
-		}
 		/* update cache */
 		atomic_store_voidptr(cache_slot, node);
-		goto out;
 	} else {
 		PTHREAD_RWLOCK_unlock(&export_by_id.lock);
 		return NULL;
@@ -311,34 +346,6 @@ struct gsh_export *get_gsh_export(uint16_t export_id)
 	get_gsh_export_ref(exp);
 	PTHREAD_RWLOCK_unlock(&export_by_id.lock);
 	return exp;
-}
-
-/**
- * @brief Set export entry's state
- *
- * Set the state under the global write lock to keep it safe
- * from scan/lookup races.
- * We assert state transitions because errors here are BAD.
- *
- * @param export [IN] The export to change state
- * @param state  [IN] the state to set
- */
-
-void set_gsh_export_state(struct gsh_export *export, export_state_t state)
-{
-	PTHREAD_RWLOCK_wrlock(&export_by_id.lock);
-	if (state == EXPORT_READY) {
-		assert(export->state == EXPORT_INIT
-		       || export->state == EXPORT_BLOCKED);
-	} else if (state == EXPORT_BLOCKED) {
-		assert(export->state == EXPORT_READY);
-	} else if (state == EXPORT_RELEASE) {
-		assert(export->state == EXPORT_BLOCKED && export->refcnt == 0);
-	} else {
-		assert(0);
-	}
-	export->state = state;
-	PTHREAD_RWLOCK_unlock(&export_by_id.lock);
 }
 
 /**
@@ -370,9 +377,6 @@ struct gsh_export *get_gsh_export_by_path_locked(char *path,
 
 	glist_for_each(glist, &exportlist) {
 		export = glist_entry(glist, struct gsh_export, exp_list);
-
-		if (export->state != EXPORT_READY)
-			continue;
 
 		len_export = strlen(export->fullpath);
 
@@ -477,9 +481,6 @@ struct gsh_export *get_gsh_export_by_pseudo_locked(char *path,
 	glist_for_each(glist, &exportlist) {
 		export = glist_entry(glist, struct gsh_export, exp_list);
 
-		if (export->state != EXPORT_READY)
-			continue;
-
 		if (export->pseudopath == NULL)
 			continue;
 
@@ -578,8 +579,7 @@ struct gsh_export *get_gsh_export_by_tag(char *tag)
 	PTHREAD_RWLOCK_rdlock(&export_by_id.lock);
 	glist_for_each(glist, &exportlist) {
 		export = glist_entry(glist, struct gsh_export, exp_list);
-		if (export->state != EXPORT_READY)
-			continue;
+
 		if (export->FS_tag != NULL &&
 		    !strcmp(export->FS_tag, tag))
 			goto out;
@@ -621,39 +621,16 @@ bool mount_gsh_export(struct gsh_export *exp)
 
 void put_gsh_export(struct gsh_export *export)
 {
-	int64_t refcount;
-	struct export_stats *export_st;
+	int64_t refcount = atomic_dec_int64_t(&export->refcnt);
 
-	assert(export->refcnt > 0);
-
-	refcount = atomic_dec_int64_t(&export->refcnt);
-
-	if (refcount != 0)
+	if (refcount != 0) {
+		assert(refcount > 0);
 		return;
+	}
 
 	/* Releasing last reference */
 
-	/* Release state belonging to this export */
-	state_release_export(export);
-
-	/* Flush cache inodes belonging to this export */
-	cache_inode_unexport(export);
-
-	/* can we really let go or do we have unfinished business? */
-	assert(glist_empty(&export->entry_list));
-	assert(glist_empty(&export->exp_state_list));
-	assert(glist_empty(&export->exp_lock_list));
-	assert(glist_empty(&export->exp_nlm_share_list));
-	assert(glist_empty(&export->mounted_exports_list));
-	assert(glist_null(&export->exp_root_list));
-	assert(glist_null(&export->mounted_exports_node));
-
-	/* free resources */
-	free_export_resources(export);
-	pthread_rwlock_destroy(&export->lock);
-	export_st = container_of(export, struct export_stats, export);
-	server_stats_free(&export_st->st);
-	gsh_free(export_st);
+	free_export(export);
 }
 
 /**
@@ -664,37 +641,45 @@ void put_gsh_export(struct gsh_export *export)
 
 void remove_gsh_export(uint16_t export_id)
 {
-	struct avltree_node *node = NULL;
-	struct avltree_node *cnode = NULL;
-	struct gsh_export *export = NULL;
 	struct gsh_export v;
-	void **cache_slot;
+	struct avltree_node *node;
+	struct gsh_export *export = NULL;
+	void **cache_slot = (void **)
+	    &(export_by_id.cache[eid_cache_offsetof(export_id)]);
 
 	v.export_id = export_id;
-
 	PTHREAD_RWLOCK_wrlock(&export_by_id.lock);
+
 	node = avltree_lookup(&v.node_k, &export_by_id.t);
 	if (node) {
-		export =
-		    avltree_container_of(node, struct gsh_export, node_k);
+		struct avltree_node *cnode = (struct avltree_node *)
+			atomic_fetch_voidptr(cache_slot);
 
-		/* Remove the export from the AVL tree */
-		cache_slot = (void **)
-		    &(export_by_id.
-		      cache[eid_cache_offsetof(&export_by_id, export_id)]);
-		cnode = (struct avltree_node *)atomic_fetch_voidptr(cache_slot);
+		/* Remove from the AVL cache and tree */
 		if (node == cnode)
 			atomic_store_voidptr(cache_slot, NULL);
 		avltree_remove(node, &export_by_id.t);
 
+		export = avltree_container_of(node, struct gsh_export, node_k);
+
 		/* Remove the export from the export list */
 		glist_del(&export->exp_list);
+
+		/* No new references will be granted. Idempotent. */
+		export->export_status = EXPORT_STALE;
 	}
 
 	PTHREAD_RWLOCK_unlock(&export_by_id.lock);
 
+	/* removal has a once-only semantic */
 	if (export != NULL) {
-		/* Release table reference to the export.
+		if (export->has_pnfs_ds) {
+			/* once-only, so no need for lock here */
+			export->has_pnfs_ds = false;
+			pnfs_ds_remove(export->export_id, true);
+		}
+
+		/* Release sentinel reference to the export.
 		 * Release of resources will occur on last reference.
 		 * Which may or may not be from this call.
 		 */
@@ -769,6 +754,26 @@ void remove_all_exports(void)
 /* DBUS interfaces
  */
 
+/**
+ * @brief Return all IO stats of an export
+ * DBUS_TYPE_ARRAY, "qs(tttttt)(tttttt)"
+ */
+
+static bool get_all_export_io(struct gsh_export *export_node, void *array_iter)
+{
+	struct export_stats *export_statistics;
+
+	LogFullDebug(COMPONENT_DBUS, "export id: %i, path: %s",
+		     export_node->export_id, export_node->fullpath);
+
+	export_statistics = container_of(export_node, struct export_stats,
+					 export);
+	server_dbus_all_iostats(export_statistics,
+				(DBusMessageIter *) array_iter);
+
+	return true;
+}
+
 /* parse the export_id in args
  */
 
@@ -807,6 +812,40 @@ static struct gsh_export *lookup_export(DBusMessageIter *args, char **errormsg)
 	return export;
 }
 
+/* Private state for config_errs_to_dbus to convert
+ * parsing error stream in to a string of '\n' terminated
+ * message lines.
+ */
+
+struct error_detail {
+	char *buf;
+	size_t bufsize;
+	FILE *fp;
+};
+
+/**
+ * @brief Report processing errors to the DBUS client.
+ *
+ * For now, they just go to the log (as before).
+ */
+
+static void config_errs_to_dbus(char *err, void *dest,
+				struct config_error_type *err_type)
+{
+	struct error_detail *err_dest = dest;
+
+	if (err_dest->fp == NULL) {
+		err_dest->fp = open_memstream(&err_dest->buf,
+					      &err_dest->bufsize);
+		if (err_dest->fp == NULL) {
+			LogCrit(COMPONENT_EXPORT,
+				"Unable to allocate space for parse errors");
+			return;
+		}
+	}
+	fprintf(err_dest->fp, "%s\n", err);
+}
+
 struct showexports_state {
 	DBusMessageIter export_iter;
 };
@@ -837,6 +876,7 @@ static bool gsh_export_addexport(DBusMessageIter *args,
 	struct config_error_type err_type;
 	DBusMessageIter iter;
 	char *err_detail = NULL;
+	struct error_detail conf_errs = {NULL, 0, NULL};
 
 	/* Get path */
 	if (dbus_message_iter_get_arg_type(args) == DBUS_TYPE_STRING)
@@ -861,24 +901,40 @@ static bool gsh_export_addexport(DBusMessageIter *args,
 	LogInfo(COMPONENT_EXPORT, "Adding export from file: %s with %s",
 		file_path, export_expr);
 
+	/* Create a memstream for parser+processing error messages */
+	if (!init_error_type(&err_type))
+		goto out;
+
 	config_struct = config_ParseFile(file_path, &err_type);
 	if (!config_error_is_harmless(&err_type)) {
 		err_detail = err_type_str(&err_type);
 		LogCrit(COMPONENT_EXPORT,
-			"Error while parsing %s", file_path); 
+			"Error while parsing %s", file_path);
+		report_config_errors(&err_type,
+				     &conf_errs,
+				     config_errs_to_dbus);
+		if (conf_errs.fp != NULL)
+			fclose(conf_errs.fp);
 		dbus_set_error(error, DBUS_ERROR_INVALID_FILE_CONTENT,
-			       "Error while parsing %s because of %s errors",
+			       "Error while parsing %s because of %s errors. Details:\n%s",
 			       file_path,
-			       err_detail != NULL ? err_detail : "unknown");
-			status = false;
-			goto out;
+			       err_detail != NULL ? err_detail : "unknown",
+			       conf_errs.buf);
+		status = false;
+		goto out;
 	}
 
-	rc = find_config_nodes(config_struct, export_expr, &config_list);
+	rc = find_config_nodes(config_struct, export_expr,
+			       &config_list, &err_type);
 	if (rc != 0) {
 		LogCrit(COMPONENT_EXPORT,
 			"Error finding exports: %s because %s",
 			export_expr, strerror(rc));
+		report_config_errors(&err_type,
+				     &conf_errs,
+				     config_errs_to_dbus);
+		if (conf_errs.fp != NULL)
+			fclose(conf_errs.fp);
 		dbus_set_error(error, DBUS_ERROR_INVALID_ARGS,
 			       "Error finding exports: %s because %s",
 			       export_expr, strerror(rc));
@@ -901,17 +957,34 @@ static bool gsh_export_addexport(DBusMessageIter *args,
 		}
 		gsh_free(lp);
 	}
+	report_config_errors(&err_type,
+			     &conf_errs,
+			     config_errs_to_dbus);
+	if (conf_errs.fp != NULL)
+		fclose(conf_errs.fp);
 	if (status) {
 		if (exp_cnt > 0) {
-			char *message = alloca(sizeof("%d exports added") + 10);
+			size_t msg_size = sizeof("%d exports added") + 10;
+			char *message;
 
-			snprintf(message,
-				 sizeof("%d exports added") + 10,
-				 "%d exports added", exp_cnt);
+			if (conf_errs.buf != NULL &&
+			    strlen(conf_errs.buf) > 0) {
+				msg_size += (strlen(conf_errs.buf)
+					     + strlen(". Errors found:\n"));
+				message = gsh_calloc(1, msg_size);
+				snprintf(message, msg_size,
+					 "%d exports added. Errors found:\n%s",
+					 exp_cnt, conf_errs.buf);
+			} else {
+				message = gsh_calloc(1, msg_size);
+				snprintf(message, msg_size,
+					 "%d exports added", exp_cnt);
+			}
 			dbus_message_iter_init_append(reply, &iter);
 			dbus_message_iter_append_basic(&iter,
 						       DBUS_TYPE_STRING,
 						       &message);
+			gsh_free(message);
 		} else if (err_type.exists) {
 			LogWarn(COMPONENT_EXPORT,
 				"Selected entries in %s already active!!!",
@@ -938,11 +1011,15 @@ static bool gsh_export_addexport(DBusMessageIter *args,
 			err_detail != NULL ? err_detail : "unknown");
 		dbus_set_error(error,
 			       DBUS_ERROR_INVALID_FILE_CONTENT,
-			       "%d export entries in %s added because %s errors",
+			       "%d export entries in %s added because %s errors. Details:\n%s",
 			       exp_cnt, file_path,
-			       err_detail != NULL ? err_detail : "unknown");
+			       err_detail != NULL ? err_detail : "unknown",
+			       conf_errs.buf);
 	}
+
 out:
+	if (conf_errs.buf)
+		gsh_free(conf_errs.buf);
 	if (err_detail != NULL)
 		gsh_free(err_detail);
 	config_Free(config_struct);
@@ -1014,7 +1091,7 @@ static struct gsh_dbus_method export_remove_export = {
 #define DISP_EXP_REPLY		\
 {				\
 	.name = "id",		\
-	.type = "i",		\
+	.type = "q",		\
 	.direction = "out"	\
 },				\
 {				\
@@ -1028,7 +1105,7 @@ static struct gsh_dbus_method export_remove_export = {
 	.direction = "out"	\
 },				\
 {				\
-	.name = "tag",	\
+	.name = "tag",		\
 	.type = "s",		\
 	.direction = "out"	\
 }
@@ -1065,7 +1142,7 @@ static bool gsh_export_displayexport(DBusMessageIter *args,
 	/* create a reply from the message */
 	dbus_message_iter_init_append(reply, &iter);
 	dbus_message_iter_append_basic(&iter,
-				       DBUS_TYPE_INT32,
+				       DBUS_TYPE_UINT16,
 				       &export->export_id);
 	path = (export->fullpath != NULL) ? export->fullpath : "";
 	dbus_message_iter_append_basic(&iter,
@@ -1107,7 +1184,7 @@ static bool export_to_dbus(struct gsh_export *exp_node, void *state)
 	timespec_add_nsecs(exp_node->last_update, &last_as_ts);
 	dbus_message_iter_open_container(&iter_state->export_iter,
 					 DBUS_TYPE_STRUCT, NULL, &struct_iter);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_INT32,
+	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT16,
 				       &exp_node->export_id);
 	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &path);
 	server_stats_summary(&struct_iter, &exp->st);
@@ -1130,7 +1207,7 @@ static bool gsh_export_showexports(DBusMessageIter *args,
 	dbus_message_iter_init_append(reply, &iter);
 	dbus_append_timestamp(&iter, &timestamp);
 	dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY,
-					 "(isbbbbbbb(tt))",
+					 "(qsbbbbbbbb(tt))",
 					 &iter_state.export_iter);
 
 	(void)foreach_gsh_export(export_to_dbus, (void *)&iter_state);
@@ -1145,7 +1222,7 @@ static struct gsh_dbus_method export_show_exports = {
 	.args = {TIMESTAMP_REPLY,
 		 {
 		  .name = "exports",
-		  .type = "a(isbbbbbbb(tt))",
+		  .type = "a(qsbbbbbbbb(tt))",
 		  .direction = "out"},
 		 END_ARG_LIST}
 };
@@ -1485,8 +1562,7 @@ static struct gsh_dbus_method export_show_total_ops = {
 static struct gsh_dbus_method global_show_total_ops = {
 	.name = "GetGlobalOPS",
 	.method = get_nfsv_global_total_ops,
-	.args = {EXPORT_ID_ARG,
-		 STATUS_REPLY,
+	.args = {STATUS_REPLY,
 		 TIMESTAMP_REPLY,
 		 TOTAL_OPS_REPLY,
 		 END_ARG_LIST}
@@ -1495,8 +1571,7 @@ static struct gsh_dbus_method global_show_total_ops = {
 static struct gsh_dbus_method global_show_fast_ops = {
 	.name = "GetFastOPS",
 	.method = get_nfsv_global_fast_ops,
-	.args = {EXPORT_ID_ARG,
-		 STATUS_REPLY,
+	.args = {STATUS_REPLY,
 		 TIMESTAMP_REPLY,
 		 TOTAL_OPS_REPLY,
 		 END_ARG_LIST}
@@ -1505,10 +1580,63 @@ static struct gsh_dbus_method global_show_fast_ops = {
 static struct gsh_dbus_method cache_inode_show = {
 	.name = "ShowCacheInode",
 	.method = show_cache_inode_stats,
-	.args = {EXPORT_ID_ARG,
-		 STATUS_REPLY,
+	.args = {STATUS_REPLY,
 		 TIMESTAMP_REPLY,
 		 TOTAL_OPS_REPLY,
+		 END_ARG_LIST}
+};
+
+/**
+ * @brief Report all IO stats of all exports in one call
+ *
+ * @return
+ *	status
+ *	error message
+ *	time
+ *	array of (
+ *		export id
+ *		string containing the protocol version
+ *		read statistics structure
+ *			(requested, transferred, total, errors, latency,
+ *			queue wait)
+ *		write statistics structure
+ *			(requested, transferred, total, errors, latency,
+ *			queue wait)
+ *	)
+ */
+static bool get_nfs_io(DBusMessageIter *args,
+				DBusMessage *message,
+				DBusError *error)
+{
+	bool success = true;
+	char *errormsg = "OK";
+	DBusMessageIter reply_iter, array_iter;
+	struct timespec timestamp;
+
+	/* create a reply iterator from the message */
+	dbus_message_iter_init_append(message, &reply_iter);
+
+	/* status and timestamp reply */
+	dbus_status_reply(&reply_iter, success, errormsg);
+	now(&timestamp);
+	dbus_append_timestamp(&reply_iter, &timestamp);
+
+	/* create an array container iterator and loop over all exports */
+	dbus_message_iter_open_container(&reply_iter, DBUS_TYPE_ARRAY,
+					 NFS_ALL_IO_REPLY_ARRAY_TYPE,
+					 &array_iter);
+	(void) foreach_gsh_export(&get_all_export_io, (void *) &array_iter);
+	dbus_message_iter_close_container(&reply_iter, &array_iter);
+
+	return true;
+}
+
+static struct gsh_dbus_method export_show_all_io = {
+	.name = "GetNFSIO",
+	.method = get_nfs_io,
+	.args = {STATUS_REPLY,
+		 TIMESTAMP_REPLY,
+		 NFS_ALL_IO_REPLY,
 		 END_ARG_LIST}
 };
 
@@ -1522,6 +1650,7 @@ static struct gsh_dbus_method *export_stats_methods[] = {
 	&global_show_total_ops,
 	&global_show_fast_ops,
 	&cache_inode_show,
+	&export_show_all_io,
 	NULL
 };
 
@@ -1559,11 +1688,10 @@ void export_pkginit(void)
 		&rwlock_attr,
 		PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
 #endif
-	pthread_rwlock_init(&export_by_id.lock, &rwlock_attr);
+	PTHREAD_RWLOCK_init(&export_by_id.lock, &rwlock_attr);
 	avltree_init(&export_by_id.t, export_id_cmpf, 0);
-	export_by_id.cache_sz = 255;
-	export_by_id.cache =
-	    gsh_calloc(export_by_id.cache_sz, sizeof(struct avltree_node *));
+	memset(&export_by_id.cache, 0, sizeof(export_by_id.cache));
+
 	glist_init(&exportlist);
 	glist_init(&mount_work);
 	glist_init(&unexport_work);

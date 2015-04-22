@@ -40,7 +40,7 @@
 #include <sys/file.h>
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
+#include "gsh_rpc.h"
 #include "nfs23.h"
 #include "nfs4.h"
 #include "mount.h"
@@ -90,7 +90,11 @@ int nfs4_op_reclaim_complete(struct nfs_argop4 *op, compound_data_t *data,
 		return res_RECLAIM_COMPLETE4->rcr_status;
 	}
 
-	if (data->session->clientid_record->cid_cb.v41.cid_reclaim_complete) {
+	/* For now, we don't handle rca_one_fs, so we won't complain about
+	 * complete already for it.
+	 */
+	if (data->session->clientid_record->cid_cb.v41.cid_reclaim_complete &&
+	    !arg_RECLAIM_COMPLETE4->rca_one_fs) {
 		res_RECLAIM_COMPLETE4->rcr_status = NFS4ERR_COMPLETE_ALREADY;
 		return res_RECLAIM_COMPLETE4->rcr_status;
 	}

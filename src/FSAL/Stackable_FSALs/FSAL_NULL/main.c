@@ -37,7 +37,7 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/types.h>
-#include "ganesha_list.h"
+#include "gsh_list.h"
 #include "FSAL/fsal_init.h"
 #include "nullfs_methods.h"
 
@@ -59,7 +59,8 @@ struct nullfs_fsal_module {
 	/* nullfsfs_specific_initinfo_t specific_info;  placeholder */
 };
 
-const char myname[] = "NULLFS";
+/* FSAL name determines name of shared library: libfsal<name>.so */
+const char myname[] = "NULL";
 
 /* filesystem info for NULLFS */
 static struct fsal_staticfsinfo_t default_posix_info = {
@@ -88,6 +89,7 @@ static struct fsal_staticfsinfo_t default_posix_info = {
 	.umask = 0,
 	.auth_exportpath_xdev = false,
 	.xattr_access_rights = 0400,	/* root=RW, owner=R */
+	.link_supports_permission_checks = true,
 };
 
 /* private helper for export object
@@ -109,7 +111,8 @@ struct fsal_staticfsinfo_t *nullfs_staticinfo(struct fsal_module *hdl)
  */
 
 static fsal_status_t init_config(struct fsal_module *fsal_hdl,
-				 config_file_t config_struct)
+				 config_file_t config_struct,
+				 struct config_error_type *err_type)
 {
 	struct nullfs_fsal_module *nullfs_me =
 	    container_of(fsal_hdl, struct nullfs_fsal_module, fsal);
@@ -147,6 +150,7 @@ static fsal_status_t init_config(struct fsal_module *fsal_hdl,
 
 fsal_status_t nullfs_create_export(struct fsal_module *fsal_hdl,
 				   void *parse_node,
+				   struct config_error_type *err_type,
 				   const struct fsal_up_vector *up_ops);
 
 /* Module initialization.
@@ -174,8 +178,8 @@ MODULE_INIT void nullfs_init(void)
 		fprintf(stderr, "NULLFS module failed to register");
 		return;
 	}
-	myself->ops->create_export = nullfs_create_export;
-	myself->ops->init_config = init_config;
+	myself->m_ops.create_export = nullfs_create_export;
+	myself->m_ops.init_config = init_config;
 }
 
 MODULE_FINI void nullfs_unload(void)

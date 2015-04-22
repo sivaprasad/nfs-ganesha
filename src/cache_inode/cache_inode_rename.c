@@ -40,7 +40,7 @@
 #include "log.h"
 #include "hashtable.h"
 #include "fsal.h"
-#include "cache_inode.h"
+#include "cache_inode_lru.h"
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -96,16 +96,45 @@ cache_inode_rename_cached_dirent(cache_entry_t *parent,
 static inline void
 src_dest_lock(cache_entry_t *src, cache_entry_t *dest)
 {
+	int rc;
 
+	/*
+	 * A problem found in this order
+	 * 1. cache_inode_readdir holds A's content_lock, and tries to
+	 * grab B's attr_lock.
+	 * 2. cache_inode_remove holds B's attr_lock, and tries to grab B's
+	 * content_lock
+	 * 3. cache_inode_rename holds B's content_lock, and tries to grab the
+	 * A's content_lock (which is held by thread 1).
+	 * This change is to avoid this deadlock.
+	 */
+
+retry_lock:
 	if (src == dest)
 		PTHREAD_RWLOCK_wrlock(&src->content_lock);
 	else {
 		if (src < dest) {
 			PTHREAD_RWLOCK_wrlock(&src->content_lock);
-			PTHREAD_RWLOCK_wrlock(&dest->content_lock);
+			rc = pthread_rwlock_trywrlock(&dest->content_lock);
+			if (rc) {
+				LogDebug(COMPONENT_CACHE_INODE,
+						"retry dest %p lock, src %p",
+						dest, src);
+				PTHREAD_RWLOCK_unlock(&src->content_lock);
+				sleep(1);
+				goto retry_lock;
+			}
 		} else {
 			PTHREAD_RWLOCK_wrlock(&dest->content_lock);
-			PTHREAD_RWLOCK_wrlock(&src->content_lock);
+			rc = pthread_rwlock_trywrlock(&src->content_lock);
+			if (rc) {
+				LogDebug(COMPONENT_CACHE_INODE,
+						"retry src %p lock, dest %p",
+						src, dest);
+				PTHREAD_RWLOCK_unlock(&dest->content_lock);
+				sleep(1);
+				goto retry_lock;
+			}
 		}
 	}
 }
@@ -167,6 +196,7 @@ cache_inode_rename(cache_entry_t *dir_src,
 	cache_inode_status_t status = CACHE_INODE_SUCCESS;
 	cache_inode_status_t status_ref_dir_src = CACHE_INODE_SUCCESS;
 	cache_inode_status_t status_ref_dir_dst = CACHE_INODE_SUCCESS;
+	cache_inode_status_t status_ref_src = CACHE_INODE_SUCCESS;
 	cache_inode_status_t status_ref_dst = CACHE_INODE_SUCCESS;
 
 	if ((dir_src->type != DIRECTORY) || (dir_dest->type != DIRECTORY)) {
@@ -188,10 +218,10 @@ cache_inode_rename(cache_entry_t *dir_src,
 	if (lookup_src == NULL) {
 		/* If FSAL FH is stale, then this was managed in
 		 * cache_inode_lookup */
-		if (status != CACHE_INODE_FSAL_ESTALE)
+		if (status != CACHE_INODE_ESTALE)
 			status = CACHE_INODE_NOT_FOUND;
 
-		LogEvent(COMPONENT_CACHE_INODE,
+		LogDebug(COMPONENT_CACHE_INODE,
 			 "Rename (%p,%s)->(%p,%s) : source doesn't exist",
 			 dir_src, oldname, dir_dest, newname);
 		goto out;
@@ -234,7 +264,7 @@ cache_inode_rename(cache_entry_t *dir_src,
 	}
 	if (status == CACHE_INODE_NOT_FOUND)
 		status = CACHE_INODE_SUCCESS;
-	if (status == CACHE_INODE_FSAL_ESTALE) {
+	if (status == CACHE_INODE_ESTALE) {
 		LogDebug(COMPONENT_CACHE_INODE,
 			 "Rename (%p,%s)->(%p,%s) : stale destination", dir_src,
 			 oldname, dir_dest, newname);
@@ -262,9 +292,9 @@ cache_inode_rename(cache_entry_t *dir_src,
 	LogFullDebug(COMPONENT_CACHE_INODE, "about to call FSAL rename");
 
 	fsal_status =
-	    dir_src->obj_handle->ops->rename(dir_src->obj_handle,
-					     oldname, dir_dest->obj_handle,
-					     newname);
+	    dir_src->obj_handle->obj_ops.rename(lookup_src->obj_handle,
+						dir_src->obj_handle, oldname,
+						dir_dest->obj_handle, newname);
 
 	LogFullDebug(COMPONENT_CACHE_INODE, "returned from FSAL rename");
 
@@ -273,6 +303,8 @@ cache_inode_rename(cache_entry_t *dir_src,
 	if (dir_src != dir_dest)
 		status_ref_dir_dst =
 			cache_inode_refresh_attrs_locked(dir_dest);
+
+	status_ref_src = cache_inode_refresh_attrs_locked(lookup_src);
 
 	LogFullDebug(COMPONENT_CACHE_INODE, "done refreshing attributes");
 
@@ -288,9 +320,8 @@ cache_inode_rename(cache_entry_t *dir_src,
 
 	if (lookup_dst) {
 		/* Force a refresh of the overwritten inode */
-		status_ref_dst =
-		    cache_inode_refresh_attrs_locked(lookup_dst);
-		if (status_ref_dst == CACHE_INODE_FSAL_ESTALE)
+		status_ref_dst = cache_inode_refresh_attrs_locked(lookup_dst);
+		if (status_ref_dst == CACHE_INODE_ESTALE)
 			status_ref_dst = CACHE_INODE_SUCCESS;
 	}
 
@@ -298,6 +329,9 @@ cache_inode_rename(cache_entry_t *dir_src,
 
 	if (status == CACHE_INODE_SUCCESS)
 		status = status_ref_dir_dst;
+
+	if (status == CACHE_INODE_SUCCESS)
+		status = status_ref_src;
 
 	if (status == CACHE_INODE_SUCCESS)
 		status = status_ref_dst;

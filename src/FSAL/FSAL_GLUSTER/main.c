@@ -16,7 +16,7 @@
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  *
  * -------------
  */
@@ -28,12 +28,13 @@
  * @author Shyamsundar R     <srangana@redhat.com>
  *
  * @brief Module core functions for FSAL_GLUSTER functionality, init etc.
- * 
+ *
  */
 
 #include "fsal.h"
 #include "FSAL/fsal_init.h"
 #include "gluster_internal.h"
+#include "FSAL/fsal_commonlib.h"
 
 /* GLUSTERFS FSAL module private storage
  */
@@ -67,9 +68,12 @@ static struct fsal_staticfsinfo_t default_gluster_info = {
 	.umask = 0,
 	.auth_exportpath_xdev = false,
 	.xattr_access_rights = 0400,	/* root=RW, owner=R */
+	.pnfs_mds = true,
+	.pnfs_ds = true,
+	.link_supports_permission_checks = true,
 };
 
-static struct glusterfs_fsal_module *glfsal_module = NULL;
+static struct glusterfs_fsal_module *glfsal_module;
 
 /* Module methods
  */
@@ -92,10 +96,17 @@ MODULE_INIT void glusterfs_init(void)
 	}
 
 	/* set up module operations */
-	glfsal_module->fsal.ops->create_export = glusterfs_create_export;
+	glfsal_module->fsal.m_ops.create_export = glusterfs_create_export;
 
 	/* setup global handle internals */
 	glfsal_module->fs_info = default_gluster_info;
+
+	/*
+	 * Following inits needed for pNFS support
+	 * get device info will used by pnfs meta data server
+	 */
+	glfsal_module->fsal.m_ops.getdeviceinfo = getdeviceinfo;
+	glfsal_module->fsal.m_ops.fsal_pnfs_ds_ops = pnfs_ds_ops_init;
 
 	LogDebug(COMPONENT_FSAL, "FSAL Gluster initialized");
 }

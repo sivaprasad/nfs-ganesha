@@ -130,6 +130,7 @@ void *_9p_rdma_thread(void *Arg)
 	unsigned int i = 0;
 	int rc = 0;
 	struct _9p_outqueue *outqueue = trans->private_data;
+	struct sockaddr *addrpeer;
 
 	priv = gsh_malloc(sizeof(*priv));
 	if (priv == NULL) {
@@ -152,15 +153,23 @@ void *_9p_rdma_thread(void *Arg)
 	priv->pconn = p_9p_conn;
 
 	for (i = 0; i < FLUSH_BUCKETS; i++) {
-		pthread_mutex_init(&p_9p_conn->flush_buckets[i].lock, NULL);
+		PTHREAD_MUTEX_init(&p_9p_conn->flush_buckets[i].lock, NULL);
 		glist_init(&p_9p_conn->flush_buckets[i].list);
 	}
 	p_9p_conn->sequence = 0;
 	atomic_store_uint32_t(&p_9p_conn->refcount, 0);
 	p_9p_conn->trans_type = _9P_RDMA;
 	p_9p_conn->trans_data.rdma_trans = trans;
+
+	addrpeer = msk_get_dst_addr(trans);
+	if (addrpeer == NULL) {
+		LogCrit(COMPONENT_9P, "Cannot get peer address");
+		goto error;
+	}
+	memcpy(&p_9p_conn->addrpeer, addrpeer,
+	       MIN(sizeof(*addrpeer), sizeof(p_9p_conn->addrpeer)));
 	p_9p_conn->client =
-		get_gsh_client((sockaddr_t *)msk_get_dst_addr(trans), false);
+		get_gsh_client(&p_9p_conn->addrpeer, false);
 
 	/* Init the fids pointers array */
 	memset(&p_9p_conn->fids,
@@ -201,7 +210,7 @@ static void _9p_rdma_setup_pernic(msk_trans_t *trans, uint8_t *outrdmabuf)
 	if (msk_getpd(trans)->private)
 		return;
 
-	pernic = malloc(sizeof(*pernic));
+	pernic = gsh_malloc(sizeof(*pernic));
 	if (!pernic) {
 		LogFatal(COMPONENT_9P,
 			 "9P/RDMA: pernic setup could not allocate pernic");
@@ -284,10 +293,10 @@ error:
 			msk_dereg_mr(pernic->outmr);
 		if (pernic->inmr)
 			msk_dereg_mr(pernic->inmr);
-		free(pernic->rdmabuf);
-		free(pernic->rdata);
+		gsh_free(pernic->rdmabuf);
+		gsh_free(pernic->rdata);
 	}
-	free(pernic);
+	gsh_free(pernic);
 	return;
 }
 
@@ -333,8 +342,8 @@ static void _9p_rdma_setup_global(uint8_t **poutrdmabuf, msk_data_t **pwdata,
 			 "9P/RDMA: trans handler could not malloc outqueue");
 		return;
 	}
-	pthread_mutex_init(&outqueue->lock, NULL);
-	pthread_cond_init(&outqueue->cond, NULL);
+	PTHREAD_MUTEX_init(&outqueue->lock, NULL);
+	PTHREAD_COND_init(&outqueue->cond, NULL);
 	outqueue->data = wdata;
 	*poutqueue = outqueue;
 }

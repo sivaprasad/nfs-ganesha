@@ -40,7 +40,6 @@
  */
 #include "config.h"
 
-#include "fsal.h"
 #include <libgen.h>		/* used for 'dirname' */
 #include <pthread.h>
 #include <sys/stat.h>
@@ -49,17 +48,20 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#ifdef HAVE_MNTENT_H
-#include <mntent.h>
-#endif
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
 #include <os/quota.h>
-#include "ganesha_list.h"
+
+#include "common_utils.h"
+#ifdef HAVE_MNTENT_H
+#include <mntent.h>
+#endif
+#include "gsh_list.h"
 #ifdef USE_BLKID
 #include <blkid/blkid.h>
 #include <uuid/uuid.h>
 #endif
+#include "fsal_api.h"
 #include "FSAL/fsal_commonlib.h"
 #include "fsal_private.h"
 #include "fsal_convert.h"
@@ -101,50 +103,17 @@ void fsal_detach_export(struct fsal_module *fsal_hdl,
 	PTHREAD_RWLOCK_unlock(&fsal_hdl->lock);
 }
 
-/* fsal_export to fsal_obj_handle helpers
+/**
+ * @brief Initialize export ops vectors
+ *
+ * @param[in] exp Export handle
+ *
  */
-
-static void fsal_attach_handle(struct fsal_module *fsal,
-			       struct glist_head *obj_link)
-{
-	PTHREAD_RWLOCK_wrlock(&fsal->lock);
-	glist_add(&fsal->handles, obj_link);
-	PTHREAD_RWLOCK_unlock(&fsal->lock);
-}
-
-static void fsal_detach_handle(struct fsal_module *fsal,
-			       struct glist_head *obj_link)
-{
-	PTHREAD_RWLOCK_wrlock(&fsal->lock);
-	glist_del(obj_link);
-	PTHREAD_RWLOCK_unlock(&fsal->lock);
-}
 
 int fsal_export_init(struct fsal_export *exp)
 {
-	exp->ops = gsh_malloc(sizeof(struct export_ops));
-	if (exp->ops == NULL)
-		goto errout;
-	memcpy(exp->ops, &def_export_ops, sizeof(struct export_ops));
-
-	exp->obj_ops = gsh_malloc(sizeof(struct fsal_obj_ops));
-	if (exp->obj_ops == NULL)
-		goto errout;
-	memcpy(exp->obj_ops, &def_handle_ops, sizeof(struct fsal_obj_ops));
-
-	exp->ds_ops = gsh_malloc(sizeof(struct fsal_ds_ops));
-	if (exp->ds_ops == NULL)
-		goto errout;
-	memcpy(exp->ds_ops, &def_ds_ops, sizeof(struct fsal_ds_ops));
-
+	memcpy(&exp->exp_ops, &def_export_ops, sizeof(struct export_ops));
 	return 0;
-
- errout:
-	if (exp->ops)
-		gsh_free(exp->ops);
-	if (exp->obj_ops)
-		gsh_free(exp->obj_ops);
-	return ENOMEM;
 }
 
 /**
@@ -158,26 +127,18 @@ int fsal_export_init(struct fsal_export *exp)
 
 void free_export_ops(struct fsal_export *exp_hdl)
 {
-	if (exp_hdl->ops) {
-		gsh_free(exp_hdl->ops);
-		exp_hdl->ops = NULL;
-	}
-	if (exp_hdl->obj_ops) {
-		gsh_free(exp_hdl->obj_ops);
-		exp_hdl->obj_ops = NULL;
-	}
-	if (exp_hdl->ds_ops) {
-		gsh_free(exp_hdl->ds_ops);
-		exp_hdl->ds_ops = NULL;
-	}
+	memset(&exp_hdl->exp_ops, 0, sizeof(exp_hdl->exp_ops));	/* poison */
 }
+
+/* fsal_export to fsal_obj_handle helpers
+ */
 
 void fsal_obj_handle_init(struct fsal_obj_handle *obj, struct fsal_export *exp,
 			  object_file_type_t type)
 {
 	pthread_rwlockattr_t attrs;
 
-	obj->ops = exp->obj_ops;
+	memcpy(&obj->obj_ops, &def_handle_ops, sizeof(struct fsal_obj_ops));
 	obj->fsal = exp->fsal;
 	obj->type = type;
 	obj->attributes.expire_time_attr = 0;
@@ -187,49 +148,80 @@ void fsal_obj_handle_init(struct fsal_obj_handle *obj, struct fsal_export *exp,
 		&attrs,
 		PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
 #endif
-	pthread_rwlock_init(&obj->lock, &attrs);
+	PTHREAD_RWLOCK_init(&obj->lock, &attrs);
 
-	fsal_attach_handle(exp->fsal, &obj->handles);
+	PTHREAD_RWLOCK_wrlock(&obj->fsal->lock);
+	glist_add(&obj->fsal->handles, &obj->handles);
+	PTHREAD_RWLOCK_unlock(&obj->fsal->lock);
 }
 
-void fsal_obj_handle_uninit(struct fsal_obj_handle *obj)
+void fsal_obj_handle_fini(struct fsal_obj_handle *obj)
 {
-	pthread_rwlock_destroy(&obj->lock);
-
-	fsal_detach_handle(obj->fsal, &obj->handles);
-
-	obj->ops = NULL;	/*poison myself */
+	PTHREAD_RWLOCK_wrlock(&obj->fsal->lock);
+	glist_del(&obj->handles);
+	PTHREAD_RWLOCK_unlock(&obj->fsal->lock);
+	PTHREAD_RWLOCK_destroy(&obj->lock);
+	memset(&obj->obj_ops, 0, sizeof(obj->obj_ops));	/* poison myself */
 	obj->fsal = NULL;
 }
 
-void fsal_attach_ds(struct fsal_module *fsal, struct glist_head *ds_link)
+/* fsal_module to fsal_pnfs_ds helpers
+ */
+
+void fsal_pnfs_ds_init(struct fsal_pnfs_ds *pds, struct fsal_module *fsal)
 {
+	pthread_rwlockattr_t attrs;
+
+	pds->refcount = 1;	/* we start out with a reference */
+	fsal->m_ops.fsal_pnfs_ds_ops(&pds->s_ops);
+	pds->fsal = fsal;
+
+	pthread_rwlockattr_init(&attrs);
+#ifdef GLIBC
+	pthread_rwlockattr_setkind_np(
+		&attrs,
+		PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+	PTHREAD_RWLOCK_init(&pds->lock, &attrs);
+	glist_init(&pds->ds_handles);
+
 	PTHREAD_RWLOCK_wrlock(&fsal->lock);
-	glist_add(&fsal->ds_handles, ds_link);
+	glist_add(&fsal->servers, &pds->server);
 	PTHREAD_RWLOCK_unlock(&fsal->lock);
 }
 
-void fsal_detach_ds(struct fsal_module *fsal, struct glist_head *ds_link)
+void fsal_pnfs_ds_fini(struct fsal_pnfs_ds *pds)
 {
-	PTHREAD_RWLOCK_wrlock(&fsal->lock);
-	glist_del(ds_link);
-	PTHREAD_RWLOCK_unlock(&fsal->lock);
+	PTHREAD_RWLOCK_wrlock(&pds->fsal->lock);
+	glist_del(&pds->server);
+	PTHREAD_RWLOCK_unlock(&pds->fsal->lock);
+	PTHREAD_RWLOCK_destroy(&pds->lock);
+	memset(&pds->s_ops, 0, sizeof(pds->s_ops));	/* poison myself */
+	pds->fsal = NULL;
 }
 
-void fsal_ds_handle_init(struct fsal_ds_handle *ds, struct fsal_ds_ops *ops,
-			 struct fsal_module *fsal)
+/* fsal_pnfs_ds to fsal_ds_handle helpers
+ */
+
+void fsal_ds_handle_init(struct fsal_ds_handle *dsh, struct fsal_pnfs_ds *pds)
 {
-	ds->refcount = 1;	/* we start out with a reference */
-	ds->ops = ops;
-	ds->fsal = fsal;
-	fsal_attach_ds(fsal, &ds->ds_handles);
+	dsh->refcount = 1;	/* we start out with a reference */
+	pds->s_ops.fsal_dsh_ops(&dsh->dsh_ops);
+	dsh->pds = pds;
+
+	PTHREAD_RWLOCK_wrlock(&pds->lock);
+	glist_add(&pds->ds_handles, &dsh->ds_handle);
+	PTHREAD_RWLOCK_unlock(&pds->lock);
 }
 
-void fsal_ds_handle_uninit(struct fsal_ds_handle *ds)
+void fsal_ds_handle_fini(struct fsal_ds_handle *dsh)
 {
-	fsal_detach_ds(ds->fsal, &ds->ds_handles);
-	ds->ops = NULL;		/*poison myself */
-	ds->fsal = NULL;
+	PTHREAD_RWLOCK_wrlock(&dsh->pds->lock);
+	glist_del(&dsh->ds_handle);
+	PTHREAD_RWLOCK_unlock(&dsh->pds->lock);
+
+	memset(&dsh->dsh_ops, 0, sizeof(dsh->dsh_ops));	/* poison myself */
+	dsh->pds = NULL;
 }
 
 /**
@@ -393,10 +385,14 @@ void display_fsinfo(struct fsal_staticfsinfo_t *info)
 		 info->share_support_owner);
 	LogDebug(COMPONENT_FSAL, "  delegations = %d  ",
 		 info->delegations);
-	LogDebug(COMPONENT_FSAL, "  pnfs_file = %d  ",
-		 info->pnfs_file);
+	LogDebug(COMPONENT_FSAL, "  pnfs_mds = %d  ",
+		 info->pnfs_mds);
+	LogDebug(COMPONENT_FSAL, "  pnfs_ds = %d  ",
+		 info->pnfs_ds);
 	LogDebug(COMPONENT_FSAL, "  fsal_trace = %d  ",
 		 info->fsal_trace);
+	LogDebug(COMPONENT_FSAL, "  fsal_grace = %d  ",
+		 info->fsal_grace);
 	LogDebug(COMPONENT_FSAL, "}");
 }
 
@@ -414,13 +410,6 @@ int open_dir_by_path_walk(int first_fd, const char *path, struct stat *stat)
 
 	/* Allocate space for duplicate */
 	name = alloca(len + 1);
-
-	if (name == NULL) {
-		LogCrit(COMPONENT_FSAL,
-			"No memory for path duplicate of %s",
-			path);
-		return -ENOMEM;
-	}
 
 	/* Copy the string */
 	memcpy(name, path, len);
@@ -752,7 +741,7 @@ int re_index_fs_dev(struct fsal_filesystem *fs,
 int change_fsid_type(struct fsal_filesystem *fs,
 		     enum fsid_type fsid_type)
 {
-	uint64_t major, minor;
+	uint64_t major = 0, minor = 0;
 	bool valid = false;
 
 	if (fs->fsid_type == fsid_type)
@@ -810,9 +799,9 @@ int change_fsid_type(struct fsal_filesystem *fs,
 			/* Shrink each 64 bit quantity to 32 bits by xoring the
 			 * two halves.
 			 */
-			major = (fs->fsid.major && MASK_32) ^
+			major = (fs->fsid.major & MASK_32) ^
 				(fs->fsid.major >> 32);
-			minor = (fs->fsid.minor && MASK_32) ^
+			minor = (fs->fsid.minor & MASK_32) ^
 				(fs->fsid.minor >> 32);
 			valid = true;
 		} else if (fs->fsid_type == FSID_ONE_UINT64) {
@@ -820,7 +809,7 @@ int change_fsid_type(struct fsal_filesystem *fs,
 			 * the high order 32 bits as major.
 			 */
 			major = fs->fsid.major >> 32;
-			minor = fs->fsid.major && MASK_32;
+			minor = fs->fsid.major & MASK_32;
 			valid = true;
 		}
 
@@ -1369,25 +1358,25 @@ int claim_posix_filesystems(const char *path,
 	int retval = 0;
 	struct fsal_filesystem *fs, *root = NULL;
 	struct glist_head *glist;
-	int pathlen = strlen(path), outlen = 0;
-
-	*root_fs = NULL;
+	struct stat statbuf;
+	struct fsal_dev__ dev;
 
 	PTHREAD_RWLOCK_wrlock(&fs_lock);
+
+	if (stat(path, &statbuf) != 0) {
+		retval = errno;
+		LogCrit(COMPONENT_FSAL,
+			"Could not stat directory for path %s", path);
+		goto out;
+	}
+	dev = posix2fsal_devt(statbuf.st_dev);
 
 	/* Scan POSIX file systems to find export root fs */
 	glist_for_each(glist, &posix_file_systems) {
 		fs = glist_entry(glist, struct fsal_filesystem, filesystems);
-		if (fs->pathlen > outlen) {
-			if (strcmp(fs->path, "/") == 0) {
-				outlen = fs->pathlen;
-				root = fs;
-			} else if ((strncmp(path, fs->path, fs->pathlen) == 0)
-				   && ((path[fs->pathlen] == '/') ||
-				       (path[fs->pathlen] == '\0'))) {
-				outlen = fs->pathlen;
-				root = fs;
-			}
+		if (fs->dev.major == dev.major && fs->dev.minor == dev.minor) {
+			root = fs;
+			break;
 		}
 	}
 
@@ -1401,7 +1390,7 @@ int claim_posix_filesystems(const char *path,
 	}
 
 	/* Claim this file system and it's children */
-	retval = process_claim(path, pathlen, root, fsal,
+	retval = process_claim(path, strlen(path), root, fsal,
 			       exp, claim, unclaim);
 
 	if (retval == 0) {

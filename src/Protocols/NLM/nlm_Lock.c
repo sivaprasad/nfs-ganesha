@@ -26,8 +26,8 @@
 #include <string.h>
 #include <pthread.h>
 #include "log.h"
-#include "ganesha_rpc.h"
-#include "nlm4.h"
+#include "fsal.h"
+#include "nfs_proto_functions.h"
 #include "sal_functions.h"
 #include "nlm_util.h"
 #include "nlm_async.h"
@@ -60,6 +60,8 @@ int nlm4_Lock(nfs_arg_t *args,
 	state_block_data_t *pblock_data;
 	const char *proc_name = "nlm4_Lock";
 	care_t care = CARE_MONITOR;
+	/* Indicate if we let FSAL to handle requests during grace. */
+	bool_t fsal_grace = false;
 
 	if (req->rq_proc == NLMPROC4_NM_LOCK) {
 		/* If call is a NM lock, indicate that we care about NLM
@@ -95,12 +97,23 @@ int nlm4_Lock(nfs_arg_t *args,
 		return NFS_REQ_OK;
 	}
 
-	/* allow only reclaim lock request during recovery and visa versa */
-	if (!fsal_grace() &&
-	    ((grace && !arg->reclaim) || (!grace && arg->reclaim))) {
+	if (grace) {
+		/* allow only reclaim lock request during recovery */
+		if (op_ctx->fsal_export->exp_ops.
+			fs_supports(op_ctx->fsal_export, fso_grace_method))
+			fsal_grace = true;
+		if (!fsal_grace && !arg->reclaim) {
+			res->res_nlm4.stat.stat = NLM4_DENIED_GRACE_PERIOD;
+			LogDebug(COMPONENT_NLM,
+				 "REQUEST RESULT: in grace %s %s",
+				 proc_name, lock_result_str(res->
+							res_nlm4.stat.stat));
+			return NFS_REQ_OK;
+		}
+	} else if (arg->reclaim) { /* don't allow reclaim if not in recovery */
 		res->res_nlm4.stat.stat = NLM4_DENIED_GRACE_PERIOD;
 		LogDebug(COMPONENT_NLM,
-			 "REQUEST RESULT: %s %s",
+			 "REQUEST RESULT: not in grace %s %s",
 			 proc_name, lock_result_str(res->res_nlm4.stat.stat));
 		return NFS_REQ_OK;
 	}
@@ -127,6 +140,19 @@ int nlm4_Lock(nfs_arg_t *args,
 		return NFS_REQ_OK;
 	}
 
+	/* Check if v4 delegations conflict with v3 op */
+	PTHREAD_RWLOCK_rdlock(&entry->state_lock);
+	if (state_deleg_conflict(entry, lock.lock_type == FSAL_LOCK_W)) {
+		PTHREAD_RWLOCK_unlock(&entry->state_lock);
+		LogDebug(COMPONENT_NLM,
+			 "NLM lock request DROPPED due to delegation conflict");
+		return NFS_REQ_DROP;
+	} else {
+		atomic_inc_uint32_t(&entry->object.file.anon_ops);
+		PTHREAD_RWLOCK_unlock(&entry->state_lock);
+	}
+
+
 	/* Cast the state number into a state pointer to protect
 	 * locks from a client that has rebooted from the SM_NOTIFY
 	 * that will release old locks
@@ -139,8 +165,13 @@ int nlm4_Lock(nfs_arg_t *args,
 				  pblock_data,
 				  &lock,
 				  &holder,
-				  &conflict,
-				  POSIX_LOCK);
+				  &conflict);
+
+	/* We prevented delegations from being granted while trying to acquire
+	 * the lock. However, when attempting to get a delegation in the
+	 * future existing locks will result in a conflict. Thus, we can
+	 * decrement the anonymous operations counter now. */
+	atomic_dec_uint32_t(&entry->object.file.anon_ops);
 
 	if (state_status != STATE_SUCCESS) {
 		res->res_nlm4test.test_stat.stat =

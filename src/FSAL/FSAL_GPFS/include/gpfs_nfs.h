@@ -85,13 +85,14 @@ struct flock
 #define OPENHANDLE_WRITE_BY_FD    136
 #define OPENHANDLE_CREATE_BY_NAME_ATTR 137
 #define OPENHANDLE_GRACE_PERIOD   138
-#define OPENHANDLE_CLEAR_BY_FD    139
+#define OPENHANDLE_ALLOCATE_BY_FD 139
 #define OPENHANDLE_REOPEN_BY_FD   140
 #define OPENHANDLE_FADVISE_BY_FD  141
 #define OPENHANDLE_SEEK_BY_FD     142
 #define OPENHANDLE_STATFS_BY_FH   143
 #define OPENHANDLE_TRACE_ME       150
 #define OPENHANDLE_QUOTA          151
+#define OPENHANDLE_FS_LOCATIONS   152
 
 struct trace_arg
 {
@@ -456,13 +457,15 @@ struct dsread_arg
   char *bufP;
   uint64_t offset;
   uint64_t length;
+  uint64_t *filesize;
   int options;
 };
 
 /* define flags for options */
-#define IO_SKIP_HOLE      (1 << 0) //  01
-#define IO_SKIP_DATA      (1 << 1) //  02
-#define IO_ALLOCATE       (1 << 2) //  04
+#define IO_SKIP_HOLE      (1 << 0) /* 01 */
+#define IO_SKIP_DATA      (1 << 1) /* 02 */
+#define IO_ALLOCATE       (1 << 2) /* 04 */
+#define IO_DEALLOCATE     (1 << 3) /* 08 */
 
 struct dswrite_arg
 {
@@ -500,6 +503,14 @@ struct write_arg
   uint32_t stability_wanted;
   uint32_t *stability_got;
   uint32_t *verifier4;
+  int options;
+};
+
+struct alloc_arg
+{
+  int fd;
+  uint64_t offset;
+  uint64_t length;
   int options;
 };
 
@@ -581,7 +592,7 @@ struct callback_arg
     struct glock *fl;
     int *flags;
     struct stat *buf;
-	struct pnfs_deviceid *dev_id;
+    struct pnfs_deviceid *dev_id;
     uint32_t *expire_attr;
 };
 #define GPFS_INTERFACE_VERSION 10000
@@ -648,6 +659,17 @@ struct xstat_arg
     struct stat *buf;
     struct fsal_fsid *fsid;
     uint32_t *expire_attr;
+};
+
+struct fs_loc_arg {
+    int mountdirfd;
+    struct gpfs_file_handle *handle;
+    int fs_root_len;
+    char *fs_root;
+    int fs_path_len;
+    char *fs_path;
+    int fs_server_len;
+    char *fs_server;
 };
 
 struct xstat_access_arg

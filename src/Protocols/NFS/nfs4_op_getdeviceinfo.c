@@ -36,8 +36,7 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include "log.h"
-#include "ganesha_rpc.h"
-#include "nfs4.h"
+#include "fsal.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
 #include "nfs_exports.h"
@@ -104,7 +103,7 @@ int nfs4_op_getdeviceinfo(struct nfs_argop4 *op, compound_data_t *data,
 
 	if (deviceid->fsal_id >= FSAL_ID_COUNT) {
 		LogInfo(COMPONENT_PNFS,
-			"GETDEVICEINFO with invalid fsal id %c",
+			"GETDEVICEINFO with invalid fsal id %0hhx",
 			deviceid->fsal_id);
 		return res_GETDEVICEINFO4->gdir_status = NFS4ERR_INVAL;
 	}
@@ -113,7 +112,7 @@ int nfs4_op_getdeviceinfo(struct nfs_argop4 *op, compound_data_t *data,
 
 	if (fsal == NULL) {
 		LogInfo(COMPONENT_PNFS,
-			"GETDEVICEINFO with inactive fsal id %c",
+			"GETDEVICEINFO with inactive fsal id %0hhx",
 			deviceid->fsal_id);
 		return res_GETDEVICEINFO4->gdir_status = NFS4ERR_INVAL;
 	}
@@ -124,7 +123,7 @@ int nfs4_op_getdeviceinfo(struct nfs_argop4 *op, compound_data_t *data,
 	    sizeof(layouttype4) +	/* Type in the device_addr4 */
 	    sizeof(uint32_t);	/* Number of bytes in da_addr_body */
 
-	da_addr_size = MIN(fsal->ops->fs_da_addr_size(fsal),
+	da_addr_size = MIN(fsal->m_ops.fs_da_addr_size(fsal),
 			   arg_GETDEVICEINFO4->gdia_maxcount - mincount);
 
 	if (da_addr_size == 0) {
@@ -150,7 +149,7 @@ int nfs4_op_getdeviceinfo(struct nfs_argop4 *op, compound_data_t *data,
 
 	da_beginning = xdr_getpos(&da_addr_body);
 
-	nfs_status = fsal->ops->getdeviceinfo(
+	nfs_status = fsal->m_ops.getdeviceinfo(
 			fsal,
 			&da_addr_body,
 			arg_GETDEVICEINFO4->gdia_layout_type,

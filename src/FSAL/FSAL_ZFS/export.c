@@ -31,10 +31,10 @@
 
 #include "config.h"
 
-#include "fsal.h"
 #include <string.h>
 #include <sys/types.h>
-#include "ganesha_list.h"
+#include "gsh_list.h"
+#include "fsal.h"
 #include "fsal_internal.h"
 #include "fsal_convert.h"
 #include "FSAL/fsal_commonlib.h"
@@ -47,14 +47,6 @@ libzfswrap_handle_t *p_zhd = NULL;
 size_t i_snapshots = 0;
 snapshot_t *p_snapshots = NULL;
 
-/*
- * ZFS internal export
- */
-
-struct zfs_fsal_export {
-	struct fsal_export export;
-	libzfswrap_vfs_t *p_vfs;
-};
 
 /* helpers to/from other ZFS objects
  */
@@ -80,7 +72,6 @@ static void release(struct fsal_export *exp_hdl)
 
 	fsal_detach_export(exp_hdl->fsal, &exp_hdl->exports);
 	free_export_ops(exp_hdl);
-	myself->export.ops = NULL;	/* poison myself */
 
 	gsh_free(myself);		/* elvis has left the building */
 }
@@ -229,7 +220,8 @@ static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
 
 static fsal_status_t tank_extract_handle(struct fsal_export *exp_hdl,
 					 fsal_digesttype_t in_type,
-					 struct gsh_buffdesc *fh_desc)
+					 struct gsh_buffdesc *fh_desc,
+					 int flags)
 {
 	struct zfs_file_handle *hdl;
 	size_t fh_size;
@@ -276,19 +268,15 @@ void zfs_export_ops_init(struct export_ops *ops)
 	ops->fs_xattr_access_rights = fs_xattr_access_rights;
 }
 
-struct zfs_export_args {
-	char *pool_path;
-};
-
 static struct config_item export_params[] = {
 	CONF_ITEM_NOOP("name"),
-	CONF_ITEM_PATH("pool_path", 1, MAXPATHLEN, NULL,
-		       zfs_export_args, pool_path),
+	CONF_MAND_STR("zpool", 1, MAXNAMLEN, "tank",
+		       zfs_fsal_export, zpool),
 	CONFIG_EOL
 };
 
 static struct config_block export_param = {
-	.dbus_interface_name = "org.ganesha.nfsd.config.fsal.zfs-export%d",
+	.dbus_interface_name = "org.ganesha.nfsd.config.fsal.zfs-export",
 	.blk_desc.name = "FSAL",
 	.blk_desc.type = CONFIG_BLOCK,
 	.blk_desc.u.blk.init = noop_conf_init,
@@ -305,23 +293,14 @@ static struct config_block export_param = {
 
 fsal_status_t zfs_create_export(struct fsal_module *fsal_hdl,
 				void *parse_node,
+				struct config_error_type *err_type,
 				const struct fsal_up_vector *up_ops)
 {
 	struct zfs_fsal_export *myself = NULL;
-	struct config_error_type err_type;
 	int retval = 0;
 	fsal_errors_t fsal_error = ERR_FSAL_INVAL;
 	libzfswrap_vfs_t *p_zfs = NULL;
-	struct zfs_export_args libargs;
 
-	retval = load_config_from_node(parse_node,
-				       &export_param,
-				       &libargs,
-				       true,
-				       &err_type);
-	if (retval != 0) {
-		goto errout;
-	}
 	myself = gsh_calloc(1, sizeof(struct zfs_fsal_export));
 	if (myself == NULL) {
 		LogMajor(COMPONENT_FSAL,
@@ -333,9 +312,23 @@ fsal_status_t zfs_create_export(struct fsal_module *fsal_hdl,
 	if (retval != 0)
 		goto errout;
 
-	zfs_export_ops_init(myself->export.ops);
-	zfs_handle_ops_init(myself->export.obj_ops);
+	zfs_export_ops_init(&myself->export.exp_ops);
 	myself->export.up_ops = up_ops;
+
+	retval = load_config_from_node(parse_node,
+				       &export_param,
+				       myself,
+				       true,
+				       err_type);
+	if (retval != 0)
+		goto errout;
+
+	if (!myself->zpool)
+		LogFatal(COMPONENT_FSAL,
+			 "You must setup a zpool for each export using FSAL_ZFS");
+	else
+		LogEvent(COMPONENT_FSAL,
+			 "Export is using %s as a ZFS tank", myself->zpool);
 
 	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);
 	if (retval != 0)
@@ -356,7 +349,7 @@ fsal_status_t zfs_create_export(struct fsal_module *fsal_hdl,
 
 	if (p_snapshots == NULL) {
 		/* Mount the libs */
-		p_zfs = libzfswrap_mount(libargs.pool_path, "/tank", "");
+		p_zfs = libzfswrap_mount(myself->zpool, "/tank", "");
 		if (p_zfs == NULL) {
 			LogMajor(COMPONENT_FSAL, "Could not mount libzfswrap");
 			libzfswrap_exit(p_zhd);
@@ -370,8 +363,6 @@ fsal_status_t zfs_create_export(struct fsal_module *fsal_hdl,
 		i_snapshots = 0;
 	}
 
-	if (libargs.pool_path)
-		gsh_free(libargs.pool_path);
 	myself->p_vfs = p_snapshots[0].p_vfs;
 	op_ctx->fsal_export = &myself->export;
 
@@ -381,11 +372,9 @@ err_locked:
 	if (myself->export.fsal != NULL)
 		fsal_detach_export(fsal_hdl, &myself->export.exports);
 errout:
-	if (libargs.pool_path)
-		gsh_free(libargs.pool_path);
 	if (myself != NULL) {
-		myself->export.ops = NULL;	/* poison myself */
-		gsh_free(myself);	/* elvis has left the building */
+		/* elvis has left the building */
+		gsh_free(myself);
 	}
 	return fsalstat(fsal_error, retval);
 }

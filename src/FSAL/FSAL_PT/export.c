@@ -38,7 +38,7 @@
 #include <mntent.h>
 #include <sys/statvfs.h>
 #include <sys/quota.h>
-#include "ganesha_list.h"
+#include "gsh_list.h"
 #include "config_parsing.h"
 #include "fsal_internal.h"
 #include "fsal_convert.h"
@@ -202,7 +202,8 @@ static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
 
 static fsal_status_t pt_extract_handle(struct fsal_export *exp_hdl,
 				       fsal_digesttype_t in_type,
-				       struct gsh_buffdesc *fh_desc)
+				       struct gsh_buffdesc *fh_desc,
+				       int flags)
 {
 	ptfsal_handle_t *hdl;
 	size_t fh_size = 0;
@@ -272,11 +273,11 @@ static struct config_block export_param = {
 
 fsal_status_t pt_create_export(struct fsal_module *fsal_hdl,
 			       void *parse_node,
+			       struct config_error_type *err_type,
 			       const struct fsal_up_vector *up_ops)
 {
 	struct pt_fsal_export *myself;
 	int retval = 0;
-	struct config_error_type err_type;
 	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
 
 	myself = gsh_malloc(sizeof(struct pt_fsal_export));
@@ -293,8 +294,7 @@ fsal_status_t pt_create_export(struct fsal_module *fsal_hdl,
 			 "pt_fsal_create: out of memory for object");
 		goto errout2;
 	}
-	pt_export_ops_init(myself->export.ops);
-	pt_handle_ops_init(myself->export.obj_ops);
+	pt_export_ops_init(&myself->export.exp_ops);
 	myself->export.up_ops = up_ops;
 
 	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);
@@ -306,7 +306,7 @@ fsal_status_t pt_create_export(struct fsal_module *fsal_hdl,
 				       &export_param,
 				       myself,
 				       true,
-				       &err_type);
+				       err_type);
 	if (retval != 0) {
 		retval = EINVAL;
 		goto errout;

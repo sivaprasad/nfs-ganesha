@@ -32,8 +32,12 @@
  *
  */
 #include "config.h"
+#include "fsal.h"
 #include "sal_functions.h"
 #include "nfs_convert.h"
+#include "nfs_core.h"
+#include "nfs_exports.h"
+#include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
 #include "server_stats.h"
 #include "export_mgr.h"
@@ -350,13 +354,13 @@ static const struct nfs4_op_desc optabv4[] = {
 		.exp_perm_flags = 0},
 
 	/* NFSv4.2 */
+	[NFS4_OP_ALLOCATE] = {
+				.name = "OP_ALLOCATE",
+				.funct = nfs4_op_allocate,
+				.free_res = nfs4_op_write_Free,
+				.exp_perm_flags = 0},
 	[NFS4_OP_COPY] = {
 				.name = "OP_COPY",
-				.funct = nfs4_op_notsupp,
-				.free_res = nfs4_op_notsupp_Free,
-				.exp_perm_flags = 0},
-	[NFS4_OP_OFFLOAD_ABORT] = {
-				.name = "OP_OFFLOAD_ABORT",
 				.funct = nfs4_op_notsupp,
 				.free_res = nfs4_op_notsupp_Free,
 				.exp_perm_flags = 0},
@@ -365,8 +369,28 @@ static const struct nfs4_op_desc optabv4[] = {
 				.funct = nfs4_op_notsupp,
 				.free_res = nfs4_op_notsupp_Free,
 				.exp_perm_flags = 0},
-	[NFS4_OP_OFFLOAD_REVOKE] = {
-				.name = "OP_OFFLOAD_REVOKE",
+	[NFS4_OP_DEALLOCATE] = {
+				.name = "OP_DEALLOCATE",
+				.funct = nfs4_op_deallocate,
+				.free_res = nfs4_op_write_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_IO_ADVISE] = {
+				.name = "OP_IO_ADVISE",
+				.funct = nfs4_op_io_advise,
+				.free_res = nfs4_op_io_advise_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_LAYOUTERROR] = {
+				.name = "OP_LAYOUTERROR",
+				.funct = nfs4_op_layouterror,
+				.free_res = nfs4_op_layouterror_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_LAYOUTSTATS] = {
+				.name = "OP_LAYOUTSTATS",
+				.funct = nfs4_op_layoutstats,
+				.free_res = nfs4_op_layoutstats_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_OFFLOAD_CANCEL] = {
+				.name = "OP_OFFLOAD_CANCEL",
 				.funct = nfs4_op_notsupp,
 				.free_res = nfs4_op_notsupp_Free,
 				.exp_perm_flags = 0},
@@ -374,11 +398,6 @@ static const struct nfs4_op_desc optabv4[] = {
 				.name = "OP_OFFLOAD_STATUS",
 				.funct = nfs4_op_notsupp,
 				.free_res = nfs4_op_notsupp_Free,
-				.exp_perm_flags = 0},
-	[NFS4_OP_WRITE_PLUS] = {
-				.name = "OP_WRITE_PLUS",
-				.funct = nfs4_op_write_plus,
-				.free_res = nfs4_op_write_Free,
 				.exp_perm_flags = 0},
 	[NFS4_OP_READ_PLUS] = {
 				.name = "OP_READ_PLUS",
@@ -390,11 +409,20 @@ static const struct nfs4_op_desc optabv4[] = {
 				.funct = nfs4_op_seek,
 				.free_res = nfs4_op_write_Free,
 				.exp_perm_flags = 0},
-	[NFS4_OP_IO_ADVISE] = {
-				.name = "OP_IO_ADVISE",
-				.funct = nfs4_op_io_advise,
-				.free_res = nfs4_op_io_advise_Free,
-				.exp_perm_flags = 0}
+	[NFS4_OP_WRITE_SAME] = {
+				.name = "OP_WRITE_SAME",
+				.funct = nfs4_op_write_plus,
+				.free_res = nfs4_op_write_Free,
+				.exp_perm_flags = 0},
+};
+
+/** Define the last valid NFS v4 op for each minor version.
+ *
+ */
+nfs_opnum4 LastOpcode[] = {
+	NFS4_OP_RELEASE_LOCKOWNER,
+	NFS4_OP_RECLAIM_COMPLETE,
+	NFS4_OP_WRITE_SAME
 };
 
 /**
@@ -427,7 +455,7 @@ int nfs4_Compound(nfs_arg_t *arg,
 	unsigned int i = 0;
 	int status = NFS4_OK;
 	compound_data_t data;
-	int opcode;
+	nfs_opnum4 opcode;
 	const uint32_t compound4_minor = arg->arg_compound4.minorversion;
 	const uint32_t argarray_len = arg->arg_compound4.argarray.argarray_len;
 	nfs_argop4 * const argarray = arg->arg_compound4.argarray.argarray_val;
@@ -537,6 +565,8 @@ int nfs4_Compound(nfs_arg_t *arg,
 	 * These checks apply only to 4.1 */
 	if (compound4_minor > 0) {
 
+		/* Check for valid operation to start an NFS v4.1 COMPOUND:
+		 */
 		if (argarray[0].argop != NFS4_OP_ILLEGAL
 		    && argarray[0].argop != NFS4_OP_SEQUENCE
 		    && argarray[0].argop != NFS4_OP_EXCHANGE_ID
@@ -564,10 +594,11 @@ int nfs4_Compound(nfs_arg_t *arg,
 			 * then server MUST return  NFS4ERR_NOT_ONLY_OP. See
 			 * 18.37.3 nd test DSESS9005 for details
 			 */
-			if (argarray[0].argop == NFS4_OP_EXCHANGE_ID
-			    || argarray[0].argop == NFS4_OP_CREATE_SESSION
-			    || argarray[0].argop == NFS4_OP_DESTROY_CLIENTID
-			    || argarray[0].argop == NFS4_OP_DESTROY_SESSION) {
+			if (argarray[0].argop == NFS4_OP_EXCHANGE_ID ||
+			    argarray[0].argop == NFS4_OP_CREATE_SESSION ||
+			    argarray[0].argop == NFS4_OP_DESTROY_CLIENTID ||
+			    argarray[0].argop == NFS4_OP_DESTROY_SESSION ||
+			    argarray[0].argop == NFS4_OP_BIND_CONN_TO_SESSION) {
 				status = NFS4ERR_NOT_ONLY_OP;
 				res->res_compound4.status = status;
 				res->res_compound4.resarray.resarray_len = 0;
@@ -597,28 +628,30 @@ int nfs4_Compound(nfs_arg_t *arg,
 		/* Used to check if OP_SEQUENCE is the first operation */
 		data.oppos = i;
 
+		/* Verify BIND_CONN_TO_SESSION is not used in a compound
+		 * with length > 1.
+		 */
+		if (i > 0 &&
+		    argarray[i].argop == NFS4_OP_BIND_CONN_TO_SESSION) {
+			status = NFS4ERR_NOT_ONLY_OP;
+			goto bad_op_state;
+		}
+
 		/* time each op */
 		now(&ts);
 		op_start_time = timespec_diff(&ServerBootTime, &ts);
 		opcode = argarray[i].argop;
-		if (compound4_minor == 0) {
-			if (opcode > NFS4_OP_RELEASE_LOCKOWNER)
-				opcode = 0;
-		} else {
-			/* already range checked for minor version mismatch,
-			 * must be 4.1
-			 */
-			if (data.session != NULL) {
-				if (data.session->fore_channel_attrs.
-				    ca_maxoperations == i) {
-					status = NFS4ERR_TOO_MANY_OPS;
-					goto bad_op_state;
-				}
-			}
 
-			if (opcode > NFS4_OP_IO_ADVISE)
-				opcode = 0;
+		/* Handle opcode overflow */
+		if (opcode > LastOpcode[compound4_minor])
+			opcode = 0;
+
+		if (compound4_minor > 0 && data.session != NULL &&
+		    data.session->fore_channel_attrs.ca_maxoperations == i) {
+			status = NFS4ERR_TOO_MANY_OPS;
+			goto bad_op_state;
 		}
+
 		LogDebug(COMPONENT_NFS_V4, "Request %d: opcode %d is %s", i,
 			 argarray[i].argop, optabv4[opcode].name);
 		perm_flags =
@@ -761,11 +794,11 @@ int nfs4_Compound(nfs_arg_t *arg,
 	/* If we have reserved a lease, update it and release it */
 	if (data.preserved_clientid != NULL) {
 		/* Update and release lease */
-		pthread_mutex_lock(&data.preserved_clientid->cid_mutex);
+		PTHREAD_MUTEX_lock(&data.preserved_clientid->cid_mutex);
 
 		update_lease(data.preserved_clientid);
 
-		pthread_mutex_unlock(&data.preserved_clientid->cid_mutex);
+		PTHREAD_MUTEX_unlock(&data.preserved_clientid->cid_mutex);
 	}
 
 	if (status != NFS4_OK)
@@ -861,12 +894,12 @@ void compound_data_Free(compound_data_t *data)
 		cache_inode_put(data->saved_entry);
 
 	if (data->current_ds) {
-		ds_put(data->current_ds);
+		ds_handle_put(data->current_ds);
 		data->current_ds = NULL;
 	}
 
 	if (data->saved_ds) {
-		ds_put(data->saved_ds);
+		ds_handle_put(data->saved_ds);
 		data->saved_ds = NULL;
 	}
 
@@ -926,12 +959,6 @@ void nfs4_Compound_CopyResOne(nfs_resop4 *res_dst, nfs_resop4 *res_src)
 	case NFS4_OP_CREATE:
 	case NFS4_OP_DELEGPURGE:
 	case NFS4_OP_DELEGRETURN:
-		nfs4_op_delegreturn_CopyRes(
-			&res_dst->nfs_resop4_u.opdelegreturn,
-			&res_src->nfs_resop4_u.opdelegreturn);
-
-		return;
-
 	case NFS4_OP_GETATTR:
 	case NFS4_OP_GETFH:
 	case NFS4_OP_LINK:
@@ -1016,15 +1043,19 @@ void nfs4_Compound_CopyResOne(nfs_resop4 *res_dst, nfs_resop4 *res_src)
 	case NFS4_OP_RECLAIM_COMPLETE:
 
 	/* NFSv4.2 */
+	case NFS4_OP_ALLOCATE:
 	case NFS4_OP_COPY:
-	case NFS4_OP_OFFLOAD_ABORT:
 	case NFS4_OP_COPY_NOTIFY:
-	case NFS4_OP_OFFLOAD_REVOKE:
+	case NFS4_OP_DEALLOCATE:
+	case NFS4_OP_IO_ADVISE:
+	case NFS4_OP_LAYOUTERROR:
+	case NFS4_OP_LAYOUTSTATS:
+	case NFS4_OP_OFFLOAD_CANCEL:
 	case NFS4_OP_OFFLOAD_STATUS:
-	case NFS4_OP_WRITE_PLUS:
 	case NFS4_OP_READ_PLUS:
 	case NFS4_OP_SEEK:
-	case NFS4_OP_IO_ADVISE:
+	case NFS4_OP_WRITE_SAME:
+	case NFS4_OP_LAST_ONE:
 		break;
 
 	case NFS4_OP_ILLEGAL:

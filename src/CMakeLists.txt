@@ -17,8 +17,19 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/modules/")
 project(nfs-ganesha C)
 # Project versioning
 set(GANESHA_MAJOR_VERSION 2)
-set(GANESHA_MINOR_VERSION 1)
+set(GANESHA_MINOR_VERSION 2)
 
+# needs to come after project()
+IF(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+	SET(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "Install prefix for common files" FORCE)
+	message(STATUS "override default CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
+	SET(SYSCONFDIR "/etc" CACHE PATH "Install prefix for common files" FORCE)
+	SET(SYSSTATEDIR "/var" CACHE PATH "Install prefix for common files" FORCE)
+ELSE()
+	message(STATUS "was set CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
+	SET(SYSCONFDIR "${CMAKE_INSTALL_PREFIX}/etc" CACHE PATH "Install prefix for common files" FORCE)
+	SET(SYSSTATEDIR "${CMAKE_INSTALL_PREFIX}/var" CACHE PATH "Install prefix for common files" FORCE)
+ENDIF(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
 # Patch level is always ".0" for mainline (master).  It is blank for development.
 # When starting a stable maintenance branch, this becomes ".N"
 # where N is monotonically increasing starting at 1. Remember to include the "." !!
@@ -118,12 +129,6 @@ set(CPACK_COMPONENT_DAEMON_DISPLAY_NAME "NFS-Ganesha daemon")
 include(${CMAKE_SOURCE_DIR}/cmake/cpack_config.cmake)
 include(CPack)
 
-# Now create a useable specfile²
-configure_file(
-  "${PROJECT_SOURCE_DIR}/nfs-ganesha.spec-in.cmake"
-  "${PROJECT_SOURCE_DIR}/nfs-ganesha.spec"
-)
-
 if (FREEBSD)
 #default gcc doesn't like using -Wuninitialized without -O on FreeBSD
     set(PLATFORM "FREEBSD")
@@ -145,12 +150,16 @@ if (MSVC)
    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 endif(MSVC)
 
-# Library destination, 32 bits / 64 bits switch is done here
-if( CMAKE_SIZEOF_VOID_P EQUAL 8 )
-    set( FSAL_DESTINATION "lib64/ganesha" )
-else( CMAKE_SIZEOF_VOID_P EQUAL 8 )
-    set( FSAL_DESTINATION "lib/ganesha" )
-endif( CMAKE_SIZEOF_VOID_P EQUAL 8 )
+IF(FSAL_DESTINATION)
+    set( FSAL_DESTINATION ${FSAL_DESTINATION} )
+ELSE()
+    # Library destination, 32 bits / 64 bits switch is done here
+    if( CMAKE_SIZEOF_VOID_P EQUAL 8 )
+        set( FSAL_DESTINATION "lib64/ganesha" )
+    else( CMAKE_SIZEOF_VOID_P EQUAL 8 )
+        set( FSAL_DESTINATION "lib/ganesha" )
+    endif( CMAKE_SIZEOF_VOID_P EQUAL 8 )
+ENDIF()
 
 # FSAL selection
 # FSALs which are enabled by default but could be disabled
@@ -162,6 +171,7 @@ option(USE_FSAL_GPFS "build GPFS FSAL" ON)
 option(USE_FSAL_ZFS "build ZFS FSAL" ON)
 option(USE_FSAL_LUSTRE "build LUSTRE FSAL" ON)
 option(USE_FSAL_XFS "build XFS support in VFS FSAL" ON)
+option(USE_FSAL_PANFS "build PanFS support in VFS FSAL" ON)
 option(USE_FSAL_GLUSTER "build GLUSTER FSAL shared library" ON)
 
 # FSALs which are disabled by default
@@ -170,6 +180,9 @@ option(USE_FSAL_HPSS "build HPSS FSAL" OFF)
 
 # SHOOK is a variant of Lustre FSAL
 option(USE_FSAL_SHOOK "build SHOOK FSAL" ON)
+
+# Activate FSAL Upcalls for FSAL_LUSTRE
+option(USE_FSAL_LUSTRE_UP "add Upcalls support for LUSTRE FSAL" OFF)
 
 # From TI-RPC
 option (USE_GSS "enable RPCSEC_GSS support" ON)
@@ -193,6 +206,7 @@ option(_NO_TCP_REGISTER "disable registration of tcp services on portmapper" ON)
 option(_NO_PORTMAPPER "disable registration on portmapper" ON)
 option(_NO_XATTRD "disable ghost xattr directory and files support" ON)
 option(DEBUG_SAL "enable debugging of SAL by keeping list of all locks, stateids, and state owners" OFF)
+option(_VALGRIND_MEMCHECK "Initialize buffers passed to GPFS ioctl that valgrind doesn't understand" OFF)
 option(PROXY_HANDLE_MAPPING "enable NFSv3 handle mapping for PROXY FSAL" OFF)
 
 # Debug symbols (-g) build flag
@@ -200,6 +214,9 @@ option(DEBUG_SYMS "include debug symbols to binaries (-g option)" OFF)
 
 # Add coverage information to build tree
 option(COVERAGE "add flag to generate coverage data at runtime" OFF)
+
+# Add coverage information to build tree
+option(ENFORCE_GCC "enforce gcc as a the C compiler used for the project" OFF)
 
 # enable code profiling [-g -pg]
 option(PROFILING "turn on code profiling (-g and -pg)" OFF)
@@ -214,6 +231,9 @@ endif( "${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION}" VERSION_GREATER "2.6" )
 # CUnit
 option(USE_CUNIT "Use Cunit test framework" OFF)
 
+# NFS RDMA
+option(USE_NFS_MSK "enable NFS/MSK support" OFF)
+
 # Enable 9P Support
 option(USE_9P "enable 9P support" ON)
 option(USE_9P_RDMA "enable 9P_RDMA support" OFF)
@@ -227,6 +247,9 @@ option(DISTNAME_HAS_GIT_DATA "Distribution package's name carries git data" OFF 
 # Build and package Python admin scripts for managing via DBus
 option(USE_ADMIN_TOOLS "Package Admin scripts" OFF)
 
+# Build and package Python gui admin scripts for managing via DBus
+option(USE_GUI_ADMIN_TOOLS "Package GUI Admin scripts" ON)
+
 # Final location for server modules such as FSAL shared objects
 # We do this separately because packaging (RPM) installs in a
 # "build root" but installs somewhere else (/usr)
@@ -236,6 +259,13 @@ set(MODULES_PATH ${CMAKE_INSTALL_PREFIX}
 
 # Enable GCC Thread-sanitizer
 option(USE_TSAN "Enable GCC Thread-Sanitizer" OFF)
+
+# Enable LTTng tracing
+option(USE_LTTNG "Enable LTTng tracing" OFF)
+
+#
+# End build options
+#
 
 # Choose a shortcut build config
 
@@ -251,6 +281,12 @@ ENDIF(DEBUG_SYMS)
 IF(COVERAGE)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --coverage")
 ENDIF(COVERAGE)
+
+# Set what's needed is GCC is enforced
+IF(ENFORCE_GCC)
+    set(CMAKE_COMPILER_IS_GNUCXX TRUE)
+    set(CMAKE_C_COMPILER gcc)
+ENDIF(ENFORCE_GCC)
 
 # Build source locations and parameters
 IF(USE_FSAL_CEPH)
@@ -337,22 +373,22 @@ if(SAMBA4_PREFIX)
   LIST(APPEND CMAKE_LIBRARY_PATH "${SAMBA4_PREFIX}/lib")
 endif()
 
-IF(USE_9P_RDMA)
-  IF(MOOSHIKA_PREFIX)
-    set(MOOSHIKA_PREFIX ${MOOSHIKA_PREFIX} CACHE PATH "Path to Mooshika installation")
-    set(ENV{PKG_CONFIG_PATH} "${PKG_CONFIG_PATH}:${MOOSHIKA_PREFIX}/lib/pkgconfig")
-  ENDIF()
-  IF(LIBIBVERBS_PREFIX)
-    set(LIBIBVERBS_PREFIX ${LIBIBVERBS_PREFIX} CACHE PATH "Path to libibverbs installation")
-    LIST(APPEND CMAKE_REQUIRED_INCLUDES "${LIBIBVERBS_PREFIX}/include")
-    include_directories("${LIBIBVERBS_PREFIX}/usr/include")
-  ENDIF()
-  IF(LIBRDMACM_PREFIX)
-    set(LIBRDMACM_PREFIX ${LIBRDMACM_PREFIX} CACHE PATH "Path to librdmacm installation")
-    LIST(APPEND CMAKE_REQUIRED_INCLUDES "${LIBRDMACM_PREFIX}/include")
-    include_directories("${LIBRDMACM_PREFIX}/include")
-  ENDIF()
+IF(MOOSHIKA_PREFIX)
+  set(MOOSHIKA_PREFIX ${MOOSHIKA_PREFIX} CACHE PATH "Path to Mooshika installation")
+  set(ENV{PKG_CONFIG_PATH} "${PKG_CONFIG_PATH}:${MOOSHIKA_PREFIX}/lib/pkgconfig")
 ENDIF()
+IF(LIBIBVERBS_PREFIX)
+  set(LIBIBVERBS_PREFIX ${LIBIBVERBS_PREFIX} CACHE PATH "Path to libibverbs installation")
+  LIST(APPEND CMAKE_REQUIRED_INCLUDES "${LIBIBVERBS_PREFIX}/include")
+  include_directories("${LIBIBVERBS_PREFIX}/usr/include")
+ENDIF()
+IF(LIBRDMACM_PREFIX)
+  set(LIBRDMACM_PREFIX ${LIBRDMACM_PREFIX} CACHE PATH "Path to librdmacm installation")
+  LIST(APPEND CMAKE_REQUIRED_INCLUDES "${LIBRDMACM_PREFIX}/include")
+  include_directories("${LIBRDMACM_PREFIX}/include")
+ENDIF()
+
+
 
 if(USE_CB_SIMULATOR AND NOT USE_DBUS)
   message(WARNING "The callback simulator needs DBUS.  Enabling DBUS")
@@ -397,7 +433,7 @@ endif(HAVE_STRING_H AND HAVE_STRINGS_H)
 
 # PROXY handle mapping needs sqlite3
 IF(PROXY_HANDLE_MAPPING)
-  check_include_files(sqlite3.h, HAVE_SQLITE3_H)
+  check_include_files(sqlite3.h HAVE_SQLITE3_H)
   check_library_exists(
     sqlite3
     sqlite3_open
@@ -460,6 +496,18 @@ if(USE_FSAL_GLUSTER)
       set(USE_FSAL_GLUSTER OFF)
     endif(STRICT_PACKAGE)
   endif((NOT HAVE_GFAPI) OR (NOT HAVE_GLUSTER_H))
+
+  if(USE_FSAL_GLUSTER)
+    check_include_files("unistd.h;attr/xattr.h" HAVE_XATTR_H)
+    if(NOT HAVE_XATTR_H)
+      if(STRICT_PACKAGE)
+        message(FATAL_ERROR "STRICT PACKAGE: Can not find attr/xattr.h, disabling GLUSTER fsal build")
+      else(STRICT_PACKAGE)
+        message(WARNING "Can not find attr/xattr.h, disabling GLUSTER fsal build")
+        set(USE_FSAL_GLUSTER OFF)
+      endif(STRICT_PACKAGE)
+    endif(NOT HAVE_XATTR_H)
+  endif(USE_FSAL_GLUSTER)
 endif(USE_FSAL_GLUSTER)
 
 if(USE_FSAL_CEPH)
@@ -534,6 +582,18 @@ if(USE_FSAL_LUSTRE AND USE_FSAL_SHOOK)
     endif(STRICT_PACKAGE)
   endif((NOT HAVE_SHOOK) OR (NOT HAVE_SHOOK_XATTRS))
 endif(USE_FSAL_LUSTRE AND USE_FSAL_SHOOK)
+
+IF(USE_FSAL_LUSTRE_UP)
+  find_library(HAVE_LCAP lcap)
+  check_include_files("lcap_client.h" HAVE_LCAP_CLIENT_H)
+  IF(NOT HAVE_LCAP OR NOT HAVE_LCAP_CLIENT_H)
+    message(WARNING "liblcap is to be installed to use Lustre upcalls")
+    set(USE_FSAL_LUSTRE_UP OFF)
+  ENDIF(NOT HAVE_LCAP OR NOT HAVE_LCAP_CLIENT_H)
+  IF(NOT HAVE_FSAL_LUSTRE)
+    message(WARNING "You must trigger Lustre FSAL ON to use Lustre upcalls")
+  ENDIF(NOT HAVE_FSAL_LUSTRE)
+ENDIF(USE_FSAL_LUSTRE_UP)
 
 if(USE_FSAL_XFS)
   check_library_exists(
@@ -637,6 +697,17 @@ if(_MSPAC_SUPPORT)
     set(_MSPAC_SUPPORT OFF)
   endif(WBCLIENT_FOUND AND WBCLIENT4_H)
 endif(_MSPAC_SUPPORT)
+
+if(USE_LTTNG)
+  # Set LTTNG_PATH_HINT on the command line
+  # if your LTTng is not in a standard place
+  find_package(LTTng)
+  if(LTTNG_FOUND)
+  else(LTTNG_FOUND)
+    message(WARNING "LTTng libraries not found. Disabling USE_LTTNG")
+    set(USE_LTTNG OFF)
+  endif(LTTNG_FOUND)
+endif(USE_LTTNG)
 
 # Cmake 2.6 has issue in managing BISON and FLEX
 if( "${CMAKE_MAJOR_VERSION}.${CMAKE_MINOR_VERSION}" VERSION_LESS "2.8" )
@@ -780,13 +851,13 @@ endif(USE_DBUS)
 
 set(GANESHA_CORE ${GANESHA_CORE} NodeList)
 
-if(USE_9P_RDMA)
+if(USE_9P_RDMA OR USE_NFS_MSK)
   find_package(PkgConfig)
   pkg_check_modules(MOOSHIKA REQUIRED libmooshika>=0.6)
   set(GANESHA_CORE ${GANESHA_CORE} ${MOOSHIKA_LIBRARIES})
   include_directories(${MOOSHIKA_INCLUDE_DIRS})
   link_directories (${MOOSHIKA_LIBRARY_DIRS})
-endif(USE_9P_RDMA)
+endif(USE_9P_RDMA OR USE_NFS_MSK)
 
 # All the plumbing in the basement
 set(SYSTEM_LIBRARIES
@@ -797,6 +868,14 @@ set(SYSTEM_LIBRARIES
   ${CMAKE_THREAD_LIBS_INIT}
   ${LIBRT}
 )
+
+# Config file; make sure it doesn't clobber an existing one
+include(${CMAKE_SOURCE_DIR}/cmake/modules/InstallPackageConfigFile.cmake)
+InstallPackageConfigFile(${CMAKE_SOURCE_DIR}/config_samples/vfs.conf ${SYSCONFDIR}/ganesha ganesha.conf)
+# Sample config files
+install(DIRECTORY config_samples DESTINATION share/doc/ganesha)
+# pre-create PREFIX/var/run/ganesha
+install(DIRECTORY DESTINATION ${SYSSTATEDIR}/run/ganesha)
 
 IF( NOT EXISTS ${PROJECT_SOURCE_DIR}/libntirpc/CMakeLists.txt )
 message( FATAL_ERROR
@@ -832,6 +911,11 @@ add_subdirectory(tools)
 if(USE_DBUS)
   add_subdirectory(dbus)
 endif(USE_DBUS)
+
+if(USE_LTTNG)
+  add_subdirectory(tracing)
+endif(USE_LTTNG)
+
 add_subdirectory(scripts)
 
 # display configuration vars
@@ -847,11 +931,13 @@ message(STATUS "USE_FSAL_VFS = ${USE_FSAL_VFS}")
 message(STATUS "USE_FSAL_CEPH = ${USE_FSAL_CEPH}")
 message(STATUS "USE_FSAL_HPSS = ${USE_FSAL_HPSS}")
 message(STATUS "USE_FSAL_XFS = ${USE_FSAL_XFS}")
+message(STATUS "USE_FSAL_PANFS = ${USE_FSAL_PANFS}")
 message(STATUS "USE_FSAL_GPFS = ${USE_FSAL_GPFS}")
 message(STATUS "USE_FSAL_PT = ${USE_FSAL_PT}")
 message(STATUS "USE_FSAL_ZFS = ${USE_FSAL_ZFS}")
 message(STATUS "USE_FSAL_LUSTRE = ${USE_FSAL_LUSTRE}")
 message(STATUS "USE_FSAL_SHOOK = ${USE_FSAL_SHOOK}")
+message(STATUS "USE_FSAL_LUSTRE_UP = ${USE_FSAL_LUSTRE_UP}")
 message(STATUS "USE_FSAL_GLUSTER = ${USE_FSAL_GLUSTER}")
 message(STATUS "USE_DBUS = ${USE_DBUS}")
 message(STATUS "USE_CB_SIMULATOR = ${USE_CB_SIMULATOR}")
@@ -867,9 +953,11 @@ message(STATUS "_NO_TCP_REGISTER = ${_NO_TCP_REGISTER}")
 message(STATUS "_NO_PORTMAPPER = ${_NO_PORTMAPPER}")
 message(STATUS "_NO_XATTRD = ${_NO_XATTRD}")
 message(STATUS "DEBUG_SAL = ${DEBUG_SAL}")
+message(STATUS "_VALGRIND_MEMCHECK = ${_VALGRIND_MEMCHECK}")
 message(STATUS "PROXY_HANDLE_MAPPING = ${PROXY_HANDLE_MAPPING}")
 message(STATUS "DEBUG_SYMS = ${DEBUG_SYMS}")
 message(STATUS "COVERAGE = ${COVERAGE}")
+message(STATUS "ENFORCE_GCC = ${ENFORCE_GCC}")
 message(STATUS "PROFILING = ${PROFILING}")
 message(STATUS "USE_GSS = ${USE_GSS}")
 message(STATUS "TIRPC_EPOLL = ${TIRPC_EPOLL}")
@@ -891,8 +979,10 @@ message(STATUS "GOLD_LINKER = ${GOLD_LINKER}")
 message(STATUS "CMAKE_INSTALL_PREFIX = ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "FSAL_DESTINATION = ${FSAL_DESTINATION}")
 message(STATUS "USE_ADMIN_TOOLS = ${USE_ADMIN_TOOLS}")
+message(STATUS "USE_GUI_ADMIN_TOOLS = ${USE_GUI_ADMIN_TOOLS}")
 message(STATUS "MODULES_PATH = ${MODULES_PATH}")
 message(STATUS "USE_TSAN = ${USE_TSAN}")
+message(STATUS "USE_LTTNG = ${USE_LTTNG}")
 
 #force command line options to be stored in cache
 set(USE_FSAL_VFS ${USE_FSAL_VFS}
@@ -918,6 +1008,11 @@ set(USE_HPSS_FSAL ${USE_HPSS_FSAL}
 set(USE_FSAL_XFS ${USE_FSAL_XFS}
   CACHE BOOL
    "build XFS FSAL"
+   FORCE)
+
+set(USE_FSAL_PANFS ${USE_FSAL_PANFS}
+  CACHE BOOL
+   "build PanFS FSAL"
    FORCE)
 
 set(USE_FSAL_GPFS ${USE_FSAL_GPFS}
@@ -980,6 +1075,11 @@ set(DEBUG_SAL ${DEBUG_SAL}
    "enable debug SAL"
    FORCE)
 
+set(_VALGRIND_MEMCHECK ${_VALGRIND_MEMCHECK}
+  CACHE BOOL
+   "Initialize buffers passed to GPFS ioctl"
+   FORCE)
+
 set(ENABLE_ERROR_INJECTION ${ENABLE_ERROR_INJECTION}
   CACHE BOOL
    "enable error injection"
@@ -999,7 +1099,6 @@ set( DISTNAME_HAS_GIT_DATA ${DISTNAME_HAS_GIT_DATA}
   CACHE BOOL
   "Distribution package's name carries git data"
   FORCE)
-
 
 set(USE_9P ${USE_9P}
   CACHE BOOL
@@ -1021,9 +1120,29 @@ set(USE_ADMIN_TOOLS ${USE_ADMIN_TOOLS}
   "Package Admin Scripts"
   FORCE)
 
+set(USE_GUI_ADMIN_TOOLS ${USE_GUI_ADMIN_TOOLS}
+  CACHE BOOL
+  "Package GUI Admin Scripts"
+  FORCE)
+
 set(USE_TSAN ${USE_TSAN}
   CACHE BOOL
   "Enable GCC Thread-Sanitizer"
+  FORCE)
+
+set(USE_LTTNG ${USE_LTTNG}
+  CACHE BOOL
+  "Enable LTTng tracing"
+  FORCE)
+
+set(USE_NFS_MSK ${USE_NFS_MSK}
+  CACHE BOOL
+  "enable nfs Mooshika"
+  FORCE)
+
+set(_USE_NFS_MSK ${USE_NFS_MSK}
+  CACHE BOOL
+  "enable nfs Mooshika in config"
   FORCE)
 
 # Now create a useable config.h
@@ -1038,62 +1157,123 @@ configure_file(
 set( PKG_NAME "${CPACK_PACKAGE_FILE_NAME}.tar.gz")
 add_custom_target(dist COMMAND ${CMAKE_MAKE_PROGRAM} package_source)
 
-# set "--with" arguments for rpmbuild
+# Tweak the "%bcond_<with|without> in the specfile for every
+# optional feature. Take care on the logic of this syntax
+# %bcond_with means you add a "--with" option, default is "without this feature"
+# %bcond_without adds a"--without" so the feature is enabled by default
 # This has to be coherent with chosen FSALs
-set( WITH_ARG "")
-
 if(USE_FSAL_LUSTRE)
-    set( WITH_ARG "${WITH_ARG} --with lustre")
+    set(BCOND_LUSTRE "%bcond_without")
+else(USE_FSAL_LUSTRE)
+    set(BCOND_LUSTRE "%bcond_with")
 endif(USE_FSAL_LUSTRE)
 
+if(USE_FSAL_LUSTRE_UP)
+    set(BCOND_FSAL_LUSTRE_UP "%bcond_without")
+else(USE_FSAL_LUSTRE_UP)
+    set(BCOND_FSAL_LUSTRE_UP "%bcond_with")
+endif(USE_FSAL_LUSTRE_UP)
+
 if(USE_FSAL_SHOOK)
-    set( WITH_ARG "${WITH_ARG} --with shook")
+    set(BCOND_SHOOK "%bcond_without")
+else(USE_FSAL_SHOOK)
+    set(BCOND_SHOOK "%bcond_with")
 endif(USE_FSAL_SHOOK)
 
 if(USE_FSAL_ZFS)
-    set( WITH_ARG "${WITH_ARG} --with zfs")
+    set(BCOND_ZFS "%bcond_without")
+else(USE_FSAL_ZFS)
+    set(BCOND_ZFS "%bcond_with")
 endif(USE_FSAL_ZFS)
 
 if(USE_FSAL_XFS)
-    set( WITH_ARG "${WITH_ARG} --with xfs")
+    set(BCOND_XFS "%bcond_without")
+else(USE_FSAL_XFS)
+    set(BCOND_XFS "%bcond_with")
 endif(USE_FSAL_XFS)
 
+if(USE_FSAL_PANFS)
+    set(BCOND_PANFS "%bcond_without")
+else(USE_FSAL_PANFS)
+    set(BCOND_PANFS "%bcond_with")
+endif(USE_FSAL_PANFS)
+
 if(USE_FSAL_GPFS)
-    set( WITH_ARG "${WITH_ARG} --with gpfs")
+    set(BCOND_GPFS "%bcond_without")
+else(USE_FSAL_GPFS)
+    set(BCOND_GPFS "%bcond_with")
 endif(USE_FSAL_GPFS)
 
 if(USE_FSAL_CEPH)
-    set( WITH_ARG "${WITH_ARG} --with ceph")
-endif(USE_FSAL_CEPH)
-
-if(USE_FSAL_CEPH)
-    set( WITH_ARG "${WITH_ARG} --with ceph")
+    set(BCOND_CEPH "%bcond_without")
+else(USE_FSAL_CEPH)
+    set(BCOND_CEPH "%bcond_with")
 endif(USE_FSAL_CEPH)
 
 if(USE_FSAL_GLUSTER)
-    set( WITH_ARG "${WITH_ARG} --with gluster")
+    set(BCOND_GLUSTER "%bcond_without")
+else(USE_FSAL_GLUSTER)
+    set(BCOND_GLUSTER "%bcond_with")
 endif(USE_FSAL_GLUSTER)
 
 if(USE_FSAL_HPSS)
-    set( WITH_ARG "${WITH_ARG} --with hpss")
+    set(BCOND_HPSS "%bcond_without")
+else(USE_FSAL_HPSS)
+    set(BCOND_HPSS "%bcond_with")
 endif(USE_FSAL_HPSS)
 
 if(USE_FSAL_PT)
-    set( WITH_ARG "${WITH_ARG} --with pt")
+    set(BCOND_PT "%bcond_without")
+else(USE_FSAL_PT)
+    set(BCOND_PT "%bcond_with")
 endif(USE_FSAL_PT)
 
 if(USE_9P_RDMA)
-    set( WITH_ARG "${WITH_ARG} --with rdma")
+    set(BCOND_RDMA "%bcond_without")
+else(USE_9P_RDMA)
+    set(BCOND_RDMA "%bcond_with")
 endif(USE_9P_RDMA)
 
+if(USE_LTTNG)
+    set(BCOND_LTTNG "%bcond_without")
+else(USE_LTTNG)
+    set(BCOND_LTTNG "%bcond_with")
+endif(USE_LTTNG)
+
+if(${ALLOCATOR} STREQUAL "jemalloc")
+    set(BCOND_JEMALLOC "%bcond_without")
+else(${ALLOCATOR} STREQUAL "jemalloc")
+    set(BCOND_JEMALLOC "%bcond_with")
+endif(${ALLOCATOR} STREQUAL "jemalloc")
+
 if(USE_ADMIN_TOOLS)
-    set( WITH_ARG "${WITH_ARG} --with utils")
+    set(BCOND_UTILS "%bcond_without")
+else(USE_ADMIN_TOOLS)
+    set(BCOND_UTILS "%bcond_with")
 endif(USE_ADMIN_TOOLS)
 
+if(USE_GUI_ADMIN_TOOLS)
+    set(BCOND_GUI_UTILS "%bcond_without")
+else(USE_GUI_ADMIN_TOOLS)
+    set(BCOND_GUI_UTILS "%bcond_with")
+endif(USE_GUI_ADMIN_TOOLS)
+
+# Now create a useable specfile
+configure_file(
+  "${PROJECT_SOURCE_DIR}/nfs-ganesha.spec-in.cmake"
+  "${PROJECT_SOURCE_DIR}/nfs-ganesha.spec"
+)
 
 add_custom_target( rpm DEPENDS dist)
 add_custom_command(TARGET rpm
-                  COMMAND sh -c "rpmbuild ${WITH_ARG} -ta ${PKG_NAME}"
+                  COMMAND sh -c "rpmbuild -ta ${PKG_NAME}"
+		  VERBATIM
+		  DEPENDS dist)
+
+set(RPMDEST "--define '_srcrpmdir ${CMAKE_CURRENT_BINARY_DIR}'")
+add_custom_target( srpm DEPENDS dist)
+add_custom_command(TARGET srpm
+                  COMMAND sh -c "rpmbuild ${RPMDEST} -ts ${PKG_NAME}"
 		  VERBATIM
 		  DEPENDS dist)
 
@@ -1123,6 +1303,7 @@ if(DOXYGEN_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 endif(DOXYGEN_FOUND)
+
 
 # Include thread-sanitizer module
 include(${CMAKE_SOURCE_DIR}/cmake/tsan.cmake)

@@ -38,7 +38,7 @@
 #include "log.h"
 #include "nfs_core.h"
 #include "nfs_exports.h"
-#include "mount.h"
+#include "fsal.h"
 #include "nfs_proto_functions.h"
 #include "export_mgr.h"
 
@@ -69,6 +69,14 @@ static bool proc_export(struct gsh_export *export, void *arg)
 	if (op_ctx->export_perms->options == 0) {
 		LogFullDebug(COMPONENT_NFSPROTO,
 			     "Client is not allowed to access Export_Id %d %s",
+			     export->export_id, export->fullpath);
+
+		return true;
+	}
+
+	if (!(op_ctx->export_perms->options & EXPORT_OPTION_NFSV3)) {
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Not exported for NFSv3, Export_Id %d %s",
 			     export->export_id, export->fullpath);
 
 		return true;
@@ -124,9 +132,25 @@ static bool proc_export(struct gsh_export *export, void *arg)
 		case MATCH_ANY_CLIENT:
 			grp_name = "*";
 			break;
+		case WILDCARDHOST_CLIENT:
+			grp_name = client->client.wildcard.wildcard;
+			break;
+		case HOSTIF_CLIENT_V6:
+			grp_name =
+			    inet_ntop(AF_INET6,
+				      &client->client.hostif.clientaddr6,
+				      addr_buf, INET6_ADDRSTRLEN);
+			if (grp_name == NULL) {
+				state->retval = errno;
+				grp_name = "Invalid Host Address";
+			}
+			break;
 		default:
 			grp_name = "<unknown>";
 		}
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Export %s client %s",
+			     export->fullpath, grp_name);
 		group->gr_name = gsh_strdup(grp_name);
 		if (group->gr_name == NULL)
 			goto nomem;

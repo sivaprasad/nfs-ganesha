@@ -36,8 +36,7 @@
 #include <pthread.h>
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
-#include "nfs4.h"
+#include "fsal.h"
 #include "nfs_core.h"
 #include "sal_functions.h"
 #include "nfs_proto_functions.h"
@@ -152,16 +151,16 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 		return res_LOCKT4->status;
 	}
 
-	pthread_mutex_lock(&clientid->cid_mutex);
+	PTHREAD_MUTEX_lock(&clientid->cid_mutex);
 
-	if (!reserve_lease(clientid)) {
-		pthread_mutex_unlock(&clientid->cid_mutex);
+	if (data->minorversion == 0 && !reserve_lease(clientid)) {
+		PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
 		dec_client_id_ref(clientid);
 		res_LOCKT4->status = NFS4ERR_EXPIRED;
 		return res_LOCKT4->status;
 	}
 
-	pthread_mutex_unlock(&clientid->cid_mutex);
+	PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
 
 	/* Is this lock_owner known ? */
 	convert_nfs4_lock_owner(&arg_LOCKT4->owner, &owner_name);
@@ -174,6 +173,8 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 				       0,
 				       NULL,
 				       CARE_ALWAYS);
+
+	LogStateOwner("Lock: ", lock_owner);
 
 	if (lock_owner == NULL) {
 		LogEvent(COMPONENT_NFS_V4_LOCK,
@@ -204,6 +205,8 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 		/* A conflicting lock from a different lock_owner,
 		 * returns NFS4ERR_DENIED
 		 */
+		LogStateOwner("Conflict: ", conflict_owner);
+
 		Process_nfs4_conflict(&res_LOCKT4->LOCKT4res_u.denied,
 				      conflict_owner,
 				      &conflict_desc);
@@ -222,9 +225,9 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 
 	/* Update the lease before exit */
 	if (data->minorversion == 0) {
-		pthread_mutex_lock(&clientid->cid_mutex);
+		PTHREAD_MUTEX_lock(&clientid->cid_mutex);
 		update_lease(clientid);
-		pthread_mutex_unlock(&clientid->cid_mutex);
+		PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
 	}
 
 	dec_client_id_ref(clientid);

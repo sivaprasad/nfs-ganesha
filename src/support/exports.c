@@ -28,17 +28,14 @@
  */
 #include "config.h"
 #include "cidr.h"
-#include "ganesha_rpc.h"
 #include "log.h"
 #include "fsal.h"
-#include "nfs23.h"
-#include "nfs4.h"
-#include "mount.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
 #include "cache_inode_lru.h"
 #include "nfs_file_handle.h"
 #include "nfs_exports.h"
+#include "nfs_ip_stats.h"
 #include "nfs_proto_functions.h"
 #include "nfs_dupreq.h"
 #include "config_parsing.h"
@@ -54,6 +51,7 @@
 #include <ctype.h>
 #include "export_mgr.h"
 #include "fsal_up.h"
+#include "sal_functions.h"
 
 struct global_export_perms export_opt = {
 	.def.anonymous_uid = ANON_UID,
@@ -70,6 +68,8 @@ struct global_export_perms export_opt = {
 		       EXPORT_OPTION_NO_DELEGATIONS,
 	.def.set = UINT32_MAX
 };
+
+static void FreeClientList(struct glist_head *clients);
 
 static void StrExportOptions(struct export_perms *p_perms, char *buffer)
 {
@@ -159,13 +159,13 @@ static void StrExportOptions(struct export_perms *p_perms, char *buffer)
 	} else
 		buf += sprintf(buf, ",         ");
 
-	if ((p_perms->set & EXPORT_OPTION_ANON_UID_SET) == 0)
+	if ((p_perms->set & EXPORT_OPTION_ANON_UID_SET) != 0)
 		buf += sprintf(buf, ", anon_uid=%6d",
 			       (int)p_perms->anonymous_uid);
 	else
 		buf += sprintf(buf, ",                ");
 
-	if ((p_perms->set & EXPORT_OPTION_ANON_GID_SET) == 0)
+	if ((p_perms->set & EXPORT_OPTION_ANON_GID_SET) != 0)
 		buf += sprintf(buf, ", anon_gid=%6d",
 			       (int)p_perms->anonymous_gid);
 	else
@@ -245,8 +245,8 @@ void LogClientListEntry(log_components_t component,
 			    perms);
 		return;
 
-	case RAW_CLIENT_LIST:
-		LogCrit(component, "  %p RAW_CLIENT_LIST: <unknown>(%s)", entry,
+	case PROTO_CLIENT:
+		LogCrit(component, "  %p PROTO_CLIENT: <unknown>(%s)", entry,
 			perms);
 		return;
 	case BAD_CLIENT:
@@ -263,54 +263,59 @@ void LogClientListEntry(log_components_t component,
 /**
  * @brief Expand the client name token into one or more client entries
  *
- * @param exp        [IN] the export this gets linked to (in tail order)
+ * @param client_list[IN] the client list this gets linked to (in tail order)
  * @param client_tok [IN] the name string.  We modify it.
+ * @param type_hint  [IN] type hint from parser for client_tok
  * @param perms      [IN] pointer to the permissions to copy into each
+ * @param cnode      [IN] opaque pointer needed for config_proc_error()
+ * @param err_type   [OUT] error handling ref
  *
  * @returns 0 on success, error count on failure
  */
 
-static int add_client(struct gsh_export *export,
-		      char *client_tok,
+static int add_client(struct glist_head *client_list,
+		      const char *client_tok,
+		      enum term_type type_hint,
 		      struct export_perms *perms,
+		      void *cnode,
 		      struct config_error_type *err_type)
 {
 	struct exportlist_client_entry__ *cli;
 	int errcnt = 0;
 	struct addrinfo *info;
+	CIDR *cidr;
+	uint32_t addr;
+	int rc;
 
 	cli = gsh_calloc(sizeof(struct exportlist_client_entry__), 1);
 	if (cli == NULL) {
-		LogMajor(COMPONENT_CONFIG,
-			 "Allocate of client space failed");
+		config_proc_error(cnode, err_type,
+				  "Allocate of client space failed");
 		goto out;
 	}
-#ifdef USE_NODELIST
-#error "Node list expansion goes here but not yet"
-#endif
 	glist_init(&cli->cle_list);
-	if (client_tok[0] == '*' && client_tok[1] == '\0') {
+	switch (type_hint) {
+	case TERM_V4_ANY:
 		cli->type = MATCH_ANY_CLIENT;
-	} else if (client_tok[0] == '@') {
+		break;
+	case TERM_NETGROUP:
 		if (strlen(client_tok) > MAXHOSTNAMELEN) {
-			LogMajor(COMPONENT_CONFIG,
-				 "netgroup (%s) name too long",
-				 client_tok);
+			config_proc_error(cnode, err_type,
+					  "netgroup (%s) name too long",
+					  client_tok);
 			err_type->invalid = true;
 			errcnt++;
 			goto out;
 		}
 		cli->client.netgroup.netgroupname = gsh_strdup(client_tok + 1);
 		cli->type = NETGROUP_CLIENT;
-	} else if (index(client_tok, '/') != NULL) {
-		CIDR *cidr;
-		uint32_t addr;
-
+		break;
+	case TERM_V4CIDR:  /* this needs to be migrated to libcidr! (no v6) */
 		cidr = cidr_from_str(client_tok);
 		if (cidr == NULL) {
-			LogMajor(COMPONENT_CONFIG,
-				 "Expected a CIDR address, got (%s)",
-				 client_tok);
+			config_proc_error(cnode, err_type,
+					  "Expected a IPv4 CIDR address, got (%s)",
+					  client_tok);
 			err_type->invalid = true;
 			errcnt++;
 			goto out;
@@ -321,84 +326,132 @@ static int add_client(struct gsh_export *export,
 		cli->client.network.netmask = ntohl(addr);
 		cidr_free(cidr);
 		cli->type = NETWORK_CLIENT;
-	} else if (index(client_tok, '*') != NULL ||
-		   index(client_tok, '?') != NULL) {
+		break;
+	case TERM_REGEX:
 		if (strlen(client_tok) > MAXHOSTNAMELEN) {
-			LogMajor(COMPONENT_CONFIG,
-				 "Wildcard client (%s) name too long",
-				 client_tok);
+			config_proc_error(cnode, err_type,
+					  "Wildcard client (%s) name too long",
+					  client_tok);
 			err_type->invalid = true;
 			errcnt++;
 			goto out;
 		}
 		cli->client.wildcard.wildcard = gsh_strdup(client_tok);
 		cli->type = WILDCARDHOST_CLIENT;
-	} else if (getaddrinfo(client_tok, NULL, NULL, &info) == 0) {
-		struct addrinfo *ap;
+		break;
+	case TERM_V4ADDR:
+		rc = inet_pton(AF_INET, client_tok,
+			       &cli->client.hostif.clientaddr);
+		assert(rc == 1);  /* this had better be grok'd by now! */
+		cli->type = HOSTIF_CLIENT;
+		break;
+	case TERM_V6ADDR:
+		rc = inet_pton(AF_INET6, client_tok,
+			       &cli->client.hostif.clientaddr6);
+		assert(rc == 1);  /* this had better be grok'd by now! */
+		cli->type = HOSTIF_CLIENT_V6;
+		break;
+	case TERM_TOKEN: /* only dns names now. */
+		rc = getaddrinfo(client_tok, NULL, NULL, &info);
+		if (rc == 0) {
+			struct addrinfo *ap, *ap_last = NULL;
+			struct in_addr in_addr_last;
+			struct in6_addr in6_addr_last;
 
-		for (ap = info; ap != NULL; ap = ap->ai_next) {
-			LogFullDebug(COMPONENT_CONFIG,
-				     "flags=%d family=%d socktype=%d protocol=%d addrlen=%d name=%s",
-				     ap->ai_flags,
-				     ap->ai_family,
-				     ap->ai_socktype,
-				     ap->ai_protocol,
-				     (int) ap->ai_addrlen,
-				     ap->ai_canonname);
-			if (cli == NULL) {
-				cli = gsh_calloc(
-				    sizeof(struct exportlist_client_entry__),
-				    1);
+			for (ap = info; ap != NULL; ap = ap->ai_next) {
+				LogFullDebug(COMPONENT_CONFIG,
+					     "flags=%d family=%d socktype=%d protocol=%d addrlen=%d name=%s",
+					     ap->ai_flags,
+					     ap->ai_family,
+					     ap->ai_socktype,
+					     ap->ai_protocol,
+					     (int) ap->ai_addrlen,
+					     ap->ai_canonname);
 				if (cli == NULL) {
-					LogMajor(COMPONENT_CONFIG,
-						 "Allocate of client space failed");
-					goto out;
+					cli = gsh_calloc(
+						sizeof(struct
+						    exportlist_client_entry__),
+						1);
+					if (cli == NULL) {
+						config_proc_error(cnode,
+								  err_type,
+								  "Allocate of client space failed");
+						err_type->resource = true;
+						errcnt++;
+						break;
+					}
+					glist_init(&cli->cle_list);
 				}
-				glist_init(&cli->cle_list);
+				if (ap->ai_family == AF_INET &&
+				    (ap->ai_socktype == SOCK_STREAM ||
+				     ap->ai_socktype == SOCK_DGRAM)) {
+					struct in_addr infoaddr =
+						((struct sockaddr_in *)
+						 ap->ai_addr)->sin_addr;
+					if (ap_last != NULL &&
+					    ap_last->ai_family
+					    == ap->ai_family &&
+					    memcmp(&infoaddr,
+						   &in_addr_last,
+						   sizeof(struct in_addr)) == 0)
+						continue;
+					memcpy(&(cli->client.hostif.clientaddr),
+					       &infoaddr,
+					       sizeof(struct in_addr));
+					cli->type = HOSTIF_CLIENT;
+					ap_last = ap;
+					in_addr_last = infoaddr;
+
+				} else if (ap->ai_family == AF_INET6 &&
+					   (ap->ai_socktype == SOCK_STREAM ||
+					    ap->ai_socktype == SOCK_DGRAM)) {
+					struct in6_addr infoaddr =
+						((struct sockaddr_in6 *)
+						 ap->ai_addr)->sin6_addr;
+
+					if (ap_last != NULL &&
+					    ap_last->ai_family == ap->ai_family
+					    &&  !memcmp(&infoaddr,
+						       &in6_addr_last,
+						       sizeof(struct in6_addr)))
+						continue;
+					/* IPv6 address */
+					memcpy(
+					    &(cli->client.hostif.clientaddr6),
+					       &infoaddr,
+					       sizeof(struct in6_addr));
+					cli->type = HOSTIF_CLIENT_V6;
+					ap_last = ap;
+					in6_addr_last = infoaddr;
+				} else
+					continue;
+				cli->client_perms = *perms;
+				LogClientListEntry(COMPONENT_CONFIG, cli);
+				glist_add_tail(client_list, &cli->cle_list);
+				cli = NULL; /* let go of it */
 			}
-			if (ap->ai_family == AF_INET &&
-			    (ap->ai_socktype == SOCK_STREAM ||
-			     ap->ai_socktype == SOCK_DGRAM)) {
-				struct in_addr infoaddr =
-					((struct sockaddr_in *)ap->ai_addr)->
-					sin_addr;
-
-				memcpy(&(cli->client.hostif.clientaddr),
-				       &infoaddr, sizeof(struct in_addr));
-				cli->type = HOSTIF_CLIENT;
-
-			} else if (ap->ai_family == AF_INET6 &&
-				   (ap->ai_socktype == SOCK_STREAM ||
-				    ap->ai_socktype == SOCK_DGRAM)) {
-				struct in6_addr infoaddr =
-				    ((struct sockaddr_in6 *)ap->ai_addr)->
-				    sin6_addr;
-
-				/* IPv6 address */
-				memcpy(&(cli->client.hostif.clientaddr6),
-				       &infoaddr, sizeof(struct in6_addr));
-				cli->type = HOSTIF_CLIENT_V6;
-			} else
-				continue;
-			cli->client_perms = *perms;
-			LogClientListEntry(COMPONENT_CONFIG, cli);
-			glist_add_tail(&export->clients,
-				       &cli->cle_list);
-			cli = NULL; /* let go of it */
+			freeaddrinfo(info);
+			goto out;
+		} else {
+			config_proc_error(cnode, err_type,
+					  "Client (%s)not found because %s",
+					  client_tok, gai_strerror(rc));
+			err_type->bogus = true;
+			errcnt++;
 		}
-		goto out;
-	} else {  /* does gsspric decode go here? */
-		LogMajor(COMPONENT_CONFIG,
-			 "Unknown client token (%s)",
-			 client_tok);
+		break;
+	default:
+		config_proc_error(cnode, err_type,
+				  "Expected a client, got a %s for (%s)",
+				  config_term_desc(type_hint),
+				  client_tok);
 		err_type->bogus = true;
 		errcnt++;
 		goto out;
 	}
 	cli->client_perms = *perms;
 	LogClientListEntry(COMPONENT_CONFIG, cli);
-	glist_add_tail(&export->clients,
-		       &cli->cle_list);
+	glist_add_tail(client_list, &cli->cle_list);
 	cli = NULL;
 out:
 	if (cli != NULL)
@@ -427,28 +480,20 @@ static void *client_init(void *link_mem, void *self_struct)
 	assert(link_mem != NULL || self_struct != NULL);
 
 	if (link_mem == NULL) {
-		struct glist_head *cli_list;
-		struct gsh_export *export;
-
-		cli_list = self_struct;
-		export = container_of(cli_list, struct gsh_export,
-				      clients);
-		glist_init(&export->clients);
 		return self_struct;
 	} else if (self_struct == NULL) {
 		cli = gsh_calloc(sizeof(struct exportlist_client_entry__), 1);
 		if (cli == NULL)
 			return NULL;
 		glist_init(&cli->cle_list);
-		cli->type = RAW_CLIENT_LIST;
+		cli->type = PROTO_CLIENT;
 		return cli;
 	} else { /* free resources case */
 		cli = self_struct;
 
+		if (!glist_empty(&cli->cle_list))
+			FreeClientList(&cli->cle_list);
 		assert(glist_empty(&cli->cle_list));
-		if (cli->type == RAW_CLIENT_LIST &&
-		    cli->client.raw_client_str != NULL)
-			gsh_free(cli->client.raw_client_str);
 		gsh_free(cli);
 		return NULL;
 	}
@@ -462,8 +507,9 @@ static void *client_init(void *link_mem, void *self_struct)
  * here and in add_client, we allocate new client entries and free
  * what was passed to us rather than try and link it in.
  *
+ * @param node [IN] the config_node **not used**
  * @param link_mem [IN] the exportlist entry. add_client adds to its glist.
- * @param self_struct  [IN] the filled out client entry with a RAW_CLIENT_LIST
+ * @param self_struct  [IN] the filled out client entry with a PROTO_CLIENT
  *
  * @return 0 on success, error count for failure.
  */
@@ -473,36 +519,18 @@ static int client_commit(void *node, void *link_mem, void *self_struct,
 {
 	struct exportlist_client_entry__ *cli;
 	struct gsh_export *export;
-	struct glist_head *cli_list;
-	char *client_list, *tok, *endptr;
 	int errcnt = 0;
 
-	cli_list = link_mem;
-	export = container_of(cli_list, struct gsh_export, clients);
+	export = container_of(link_mem, struct gsh_export, clients);
 	cli = self_struct;
-	assert(cli->type == RAW_CLIENT_LIST);
-
-	client_list = cli->client.raw_client_str;
-	cli->client.raw_client_str = NULL;
-	if (client_list == NULL || client_list[0] == '\0') {
+	assert(cli->type == PROTO_CLIENT);
+	if (glist_empty(&cli->cle_list)) {
 		LogCrit(COMPONENT_CONFIG,
 			"No clients specified");
 		err_type->invalid = true;
 		errcnt++;
-	}
-	/* take the first token for ourselves.  it may expand!
-	 * loop thru the rest and use our options as theirs (copy)
-	 */
-	tok = client_list;
-	while (errcnt == 0 && tok != NULL) {
-		endptr = index(tok, ',');
-		if (endptr != NULL)
-			*endptr++ = '\0';
-		LogMidDebug(COMPONENT_CONFIG,
-			    "Adding client %s", tok);
-		errcnt += add_client(export, tok, &cli->client_perms,
-				     err_type);
-		tok = endptr;
+	} else {
+		glist_splice_tail(&export->clients, &cli->cle_list);
 	}
 	if (errcnt == 0)
 		client_init(link_mem, self_struct);
@@ -510,52 +538,12 @@ static int client_commit(void *node, void *link_mem, void *self_struct,
 }
 
 /**
- * @brief Init and commit for FSAL sub-block of an export
- */
-
-struct fsal_params {
-	char *name;
-};
-
-/**
- * @brief Initialize space for an FSAL sub-block.
- *
- * We allocate space to hold the name parameter so that
- * is available in the commit phase.
- */
-
-static void *fsal_init(void *link_mem, void *self_struct)
-{
-	struct fsal_params *fp;
-
-	assert(link_mem != NULL || self_struct != NULL);
-
-	if (link_mem == NULL) {
-		return self_struct; /* NOP */
-	} else if (self_struct == NULL) {
-		fp = gsh_calloc(sizeof(struct fsal_params), 1);
-		if (fp == NULL)
-			return NULL;
-		return fp;
-	} else {
-		fp = self_struct;
-		if (fp->name != NULL)
-			gsh_free(fp->name);
-		gsh_free(fp);
-		return NULL;
-	}
-}
-
-/**
  * @brief Commit a FSAL sub-block
  *
  * Use the Name parameter passed in via the link_mem to lookup the
  * fsal.  If the fsal is not loaded (yet), load it and call its init.
- * This will trigger the processing of a top level block of the same
- * name as the fsal, i.e. the VFS fsal will look for a VFS block
- * and process it (if found).
  *
- * Create an export and pass it the FSAL sub-block to it so that the
+ * Create an export and pass the FSAL sub-block to it so that the
  * fsal method can process the rest of the parameters in the block
  */
 
@@ -563,55 +551,22 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 		       struct config_error_type *err_type)
 {
 	struct fsal_export **exp_hdl = link_mem;
-	struct fsal_params *fp = self_struct;
+	struct gsh_export *export =
+	    container_of(exp_hdl, struct gsh_export, fsal_export);
+	struct fsal_args *fp = self_struct;
 	struct fsal_module *fsal;
-	struct gsh_export *export;
-	fsal_status_t status;
-	int errcnt = 0;
 	struct root_op_context root_op_context;
 	uint64_t MaxRead, MaxWrite;
-
-	if (fp->name == NULL || strlen(fp->name) == 0) {
-		LogCrit(COMPONENT_CONFIG,
-			"Name of FSAL is empty");
-		err_type->missing = true;
-		errcnt++;
-		goto err;
-	}
-
-	export = container_of(exp_hdl, struct gsh_export, fsal_export);
+	fsal_status_t status;
+	int errcnt;
 
 	/* Initialize req_ctx */
 	init_root_op_context(&root_op_context, export, NULL, 0, 0,
 			     UNKNOWN_REQUEST);
 
-	fsal = lookup_fsal(fp->name);
-	if (fsal == NULL) {
-		int retval;
-		config_file_t myconfig;
-
-		retval = load_fsal(fp->name, &fsal);
-		if (retval != 0) {
-			LogCrit(COMPONENT_CONFIG,
-				"Failed to load FSAL (%s)"
-				" because: %s", fp->name,
-				strerror(retval));
-			err_type->fsal = true;
-			errcnt++;
-			goto err;
-		}
-		myconfig = get_parse_root(node);
-		status = fsal->ops->init_config(fsal, myconfig);
-		if (FSAL_IS_ERROR(status)) {
-			LogCrit(COMPONENT_CONFIG,
-				"Failed to initialize FSAL (%s)",
-				fp->name);
-			fsal_put(fsal);
-			err_type->fsal = true;
-			errcnt++;
-			goto err;
-		}
-	}
+	errcnt = fsal_load_init(node, fp->name, &fsal, err_type);
+	if (errcnt > 0)
+		goto err;
 
 	/* Some admins stuff a '/' at  the end for some reason.
 	 * chomp it so we have a /dir/path/basename to work
@@ -626,8 +581,8 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 			pathlen--;
 		export->fullpath[pathlen] = '\0';
 	}
-	status = fsal->ops->create_export(fsal,
-					  node,
+	status = fsal->m_ops.create_export(fsal,
+					   node, err_type,
 					  &fsal_up_top);
 	if ((export->options_set & EXPORT_OPTION_EXPIRE_SET) == 0)
 		export->expire_time_attr = cache_param.expire_time_attr;
@@ -649,8 +604,10 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 	/* We are connected up to the fsal side.  Now
 	 * validate maxread/write etc with fsal params
 	 */
-	MaxRead = export->fsal_export->ops->fs_maxread(export->fsal_export);
-	MaxWrite = export->fsal_export->ops->fs_maxwrite(export->fsal_export);
+	MaxRead = export->fsal_export->
+		exp_ops.fs_maxread(export->fsal_export);
+	MaxWrite = export->fsal_export->
+		exp_ops.fs_maxwrite(export->fsal_export);
 
 	if (export->MaxRead > MaxRead && MaxRead != 0) {
 		LogInfo(COMPONENT_CONFIG,
@@ -668,6 +625,7 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 	}
 
 err:
+	release_root_op_context();
 	return errcnt;
 }
 
@@ -709,8 +667,9 @@ static void *export_init(void *link_mem, void *self_struct)
  * parameters are already done.
  */
 
-static int export_commit(void *node, void *link_mem, void *self_struct,
-			 struct config_error_type *err_type)
+static int export_commit_common(void *node, void *link_mem, void *self_struct,
+				struct config_error_type *err_type,
+				bool add_export)
 {
 	struct gsh_export *export, *probe_exp;
 	int errcnt = 0;
@@ -765,6 +724,17 @@ static int export_commit(void *node, void *link_mem, void *self_struct,
 	}
 	if (errcnt)
 		goto err_out;  /* have basic errors. don't even try more... */
+
+	/* export->fsal_export is valid iff fsal_commit succeeds.
+	 * Config code calls export_commit even if fsal_commit fails at
+	 * the moment, so error out here if fsal_commit failed.
+	 */
+	if (export->fsal_export == NULL) {
+		err_type->validate = true;
+		errcnt++;
+		goto err_out;
+	}
+
 	probe_exp = get_gsh_export(export->export_id);
 	if (probe_exp != NULL) {
 		LogDebug(COMPONENT_CONFIG,
@@ -819,10 +789,6 @@ static int export_commit(void *node, void *link_mem, void *self_struct,
 				 export->export_id);
 		goto err_out;  /* have errors. don't init or load a fsal */
 	}
-	glist_init(&export->exp_state_list);
-	glist_init(&export->exp_lock_list);
-	glist_init(&export->exp_nlm_share_list);
-	glist_init(&export->mounted_exports_list);
 
 	/* now probe the fsal and init it */
 	/* pass along the block that is/was the FS_Specific */
@@ -835,22 +801,38 @@ static int export_commit(void *node, void *link_mem, void *self_struct,
 		goto err_out;
 	}
 
-	/* This export must be mounted to the PseudoFS if NFS v4 */
-	if (export->export_perms.options & EXPORT_OPTION_NFSV4)
+	/* add_export_commit shouldn't add this export to mount work as
+	 * add_export_commit deals with creating pseudo mount directly.
+	 * So add this export to mount work only if NFSv4 exported and
+	 * is not a dynamically added export.
+	 */
+	if (!add_export && export->export_perms.options & EXPORT_OPTION_NFSV4)
 		export_add_to_mount_work(export);
 
 	StrExportOptions(&export->export_perms, perms);
 
-	LogEvent(COMPONENT_CONFIG,
-		 "Export %d created at pseudo (%s) with path (%s) and tag (%s) perms (%s)",
-		 export->export_id, export->pseudopath,
-		 export->fullpath, export->FS_tag, perms);
-	set_gsh_export_state(export, EXPORT_READY);
+	LogInfo(COMPONENT_CONFIG,
+		"Export %d created at pseudo (%s) with path (%s) and tag (%s) perms (%s)",
+		export->export_id, export->pseudopath,
+		export->fullpath, export->FS_tag, perms);
+
+	LogInfo(COMPONENT_CONFIG,
+		"Export %d has %ld defined clients", export->export_id,
+		glist_length(&export->clients));
 	put_gsh_export(export);
 	return 0;
 
 err_out:
 	return errcnt;
+}
+
+static int export_commit(void *node, void *link_mem, void *self_struct,
+			 struct config_error_type *err_type)
+{
+	bool add_export = false; /* not a dynamic add export */
+
+	return export_commit_common(node, link_mem, self_struct, err_type,
+				    add_export);
 }
 
 /**
@@ -885,19 +867,30 @@ static int add_export_commit(void *node, void *link_mem, void *self_struct,
 {
 	struct gsh_export *export = self_struct;
 	int errcnt = 0;
+	int status;
+	bool add_export = true; /* dynamic add export */
 
-	errcnt = export_commit(node, link_mem, self_struct, err_type);
+	errcnt = export_commit_common(node, link_mem, self_struct, err_type,
+				      add_export);
 	if (errcnt != 0)
 		goto err_out;
 
-	if (!init_export_root(export)) {
-		err_type->resource = true;
+	status = init_export_root(export);
+	if (status) {
+		export_revert(export);
 		errcnt++;
+		if (status == EINVAL)
+			err_type->invalid = true;
+		else if (status == EFAULT)
+			err_type->internal = true;
+		else
+			err_type->resource = true;
 		goto err_out;
 	}
 
 	if (!mount_gsh_export(export)) {
-		err_type->resource = true;
+		export_revert(export);
+		err_type->internal = true;
 		errcnt++;
 	}
 
@@ -1016,12 +1009,14 @@ static struct config_item_list sec_types[] = {
  */
 
 static struct config_item_list squash_types[] = {
-	CONFIG_LIST_TOK("Root", 0),
-	CONFIG_LIST_TOK("Root_Squash", 0),
-	CONFIG_LIST_TOK("RootSquash", 0),
+	CONFIG_LIST_TOK("Root", EXPORT_OPTION_ROOT_SQUASH),
+	CONFIG_LIST_TOK("Root_Squash", EXPORT_OPTION_ROOT_SQUASH),
+	CONFIG_LIST_TOK("RootSquash", EXPORT_OPTION_ROOT_SQUASH),
 	CONFIG_LIST_TOK("All", EXPORT_OPTION_ALL_ANONYMOUS),
 	CONFIG_LIST_TOK("All_Squash", EXPORT_OPTION_ALL_ANONYMOUS),
 	CONFIG_LIST_TOK("AllSquash", EXPORT_OPTION_ALL_ANONYMOUS),
+	CONFIG_LIST_TOK("All_Anonymous", EXPORT_OPTION_ALL_ANONYMOUS),
+	CONFIG_LIST_TOK("AllAnonymous", EXPORT_OPTION_ALL_ANONYMOUS),
 	CONFIG_LIST_TOK("No_Root_Squash", EXPORT_OPTION_ROOT),
 	CONFIG_LIST_TOK("None", EXPORT_OPTION_ROOT),
 	CONFIG_LIST_TOK("NoIdSquash", EXPORT_OPTION_ROOT),
@@ -1043,6 +1038,17 @@ static struct config_item_list delegations[] = {
 	CONFIG_LIST_EOL
 };
 
+struct config_item_list deleg_types[] =  {
+	CONFIG_LIST_TOK("NONE", FSAL_OPTION_NO_DELEGATIONS),
+	CONFIG_LIST_TOK("Read", FSAL_OPTION_FILE_READ_DELEG),
+	CONFIG_LIST_TOK("Write", FSAL_OPTION_FILE_WRITE_DELEG),
+	CONFIG_LIST_TOK("Readwrite", FSAL_OPTION_FILE_DELEGATIONS),
+	CONFIG_LIST_TOK("R", FSAL_OPTION_FILE_READ_DELEG),
+	CONFIG_LIST_TOK("W", FSAL_OPTION_FILE_WRITE_DELEG),
+	CONFIG_LIST_TOK("RW", FSAL_OPTION_FILE_DELEGATIONS),
+	CONFIG_LIST_EOL
+};
+
 #define CONF_EXPORT_PERMS(_struct_, _perms_)				\
 	/* Note: Access_Type defaults to None on purpose */		\
 	CONF_ITEM_ENUM_BITS_SET("Access_Type",				\
@@ -1055,10 +1061,10 @@ static struct config_item_list delegations[] = {
 	CONF_ITEM_LIST_BITS_SET("Transports",				\
 		EXPORT_OPTION_TRANSPORTS, EXPORT_OPTION_TRANSPORTS,	\
 		transports, _struct_, _perms_.options, _perms_.set),	\
-	CONF_ITEM_ANONID("Anonymous_uid",				\
+	CONF_ITEM_ANON_ID_SET("Anonymous_uid",				\
 		ANON_UID, _struct_, _perms_.anonymous_uid,		\
 		EXPORT_OPTION_ANON_UID_SET, _perms_.set),		\
-	CONF_ITEM_ANONID("Anonymous_gid",				\
+	CONF_ITEM_ANON_ID_SET("Anonymous_gid",				\
 		ANON_GID, _struct_, _perms_.anonymous_gid,		\
 		EXPORT_OPTION_ANON_GID_SET, _perms_.set),		\
 	CONF_ITEM_LIST_BITS_SET("SecType",				\
@@ -1085,6 +1091,49 @@ static struct config_item_list delegations[] = {
 		_struct_, _perms_.options, _perms_.set)
 
 /**
+ * @brief Process a list of clients for a client block
+ *
+ * CONFIG_PROC handler that gets called for each token in the term list.
+ * Create a exportlist_client_entry__ for each token and link it into
+ * the proto client's cle_list list head.  We will pass that head to the
+ * export in commit.
+ *
+ * NOTES: this is the place to expand a node list with perhaps moving the
+ * call to add_client into the expander rather than build a list there
+ * to be then walked here...
+ *
+ * @param token [IN] pointer to token string from parse tree
+ * @param type_hint [IN] a type hint from what the parser recognized
+ * @param item [IN] pointer to the config item table entry
+ * @param param_addr [IN] pointer to prototype client entry
+ * @param err_type [OUT] error handling
+ * @return error count
+ */
+
+static int client_adder(const char *token,
+			enum term_type type_hint,
+			struct config_item *item,
+			void *param_addr,
+			void *cnode,
+			struct config_error_type *err_type)
+{
+	struct exportlist_client_entry__ *proto_cli;
+	int rc;
+
+	proto_cli = container_of(param_addr,
+				 struct exportlist_client_entry__,
+				 cle_list);
+#ifdef USE_NODELIST
+#error "Node list expansion goes here but not yet"
+#endif
+	LogMidDebug(COMPONENT_CONFIG, "Adding client %s", token);
+	rc = add_client(&proto_cli->cle_list,
+			token, type_hint,
+			&proto_cli->client_perms, cnode, err_type);
+	return rc;
+}
+
+/**
  * @brief Table of client sub-block parameters
  *
  * NOTE: node discovery is ordered by this table!
@@ -1094,8 +1143,8 @@ static struct config_item_list delegations[] = {
 
 static struct config_item client_params[] = {
 	CONF_EXPORT_PERMS(exportlist_client_entry__, client_perms),
-	CONF_ITEM_STR("Clients", 1, MAXPATHLEN, NULL,
-		      exportlist_client_entry__, client.raw_client_str),
+	CONF_ITEM_PROC("Clients", noop_conf_init, client_adder,
+		       exportlist_client_entry__, cle_list),
 	CONFIG_EOL
 };
 
@@ -1119,7 +1168,7 @@ static struct config_item export_defaults_params[] = {
 
 static struct config_item fsal_params[] = {
 	CONF_ITEM_STR("Name", 1, 10, NULL,
-		      fsal_params, name), /* cheater union */
+		      fsal_args, name), /* cheater union */
 	CONFIG_EOL
 };
 
@@ -1127,7 +1176,7 @@ static struct config_item fsal_params[] = {
  * @brief Table of EXPORT block parameters
  *
  * NOTE: the Client and FSAL sub-blocks must be the *last*
- * two entries in the list.  This is so all other export
+ * two entries in the list.  This is so all other
  * parameters have been processed before these sub-blocks
  * are processed.
  */
@@ -1161,6 +1210,12 @@ static struct config_item export_params[] = {
 	CONF_ITEM_BOOLBIT_SET("UseCookieVerifier",
 		true, EXPORT_OPTION_USE_COOKIE_VERIFIER,
 		gsh_export, options, options_set),
+	CONF_ITEM_BOOLBIT_SET("DisableReaddirPlus",
+		false, EXPORT_OPTION_NO_READDIR_PLUS,
+		gsh_export, options, options_set),
+	CONF_ITEM_BOOLBIT_SET("Trust_Readdir_Negative_Cache",
+		false, EXPORT_OPTION_TRUST_READIR_NEGATIVE_CACHE,
+		gsh_export, options, options_set),
 	CONF_EXPORT_PERMS(gsh_export, export_perms),
 	CONF_ITEM_BLOCK("Client", client_params,
 			client_init, client_commit,
@@ -1178,7 +1233,7 @@ static struct config_item export_params[] = {
  * @brief Top level definition for an EXPORT block
  */
 
-struct config_block export_param = {
+static struct config_block export_param = {
 	.dbus_interface_name = "org.ganesha.nfsd.config.%d",
 	.blk_desc.name = "EXPORT",
 	.blk_desc.type = CONFIG_BLOCK,
@@ -1227,7 +1282,7 @@ struct config_block export_defaults_param = {
  * @return -1 on error, 0 if we already have one, 1 if created one
  */
 
-static int build_default_root(void)
+static int build_default_root(struct config_error_type *err_type)
 {
 	struct gsh_export *export;
 	struct fsal_module *fsal_hdl = NULL;
@@ -1257,6 +1312,8 @@ static int build_default_root(void)
 	}
 
 	/* allocate and initialize the exportlist part with the id */
+	LogDebug(COMPONENT_CONFIG,
+		 "Allocating Pseudo root export");
 	export = alloc_export();
 
 	if (export == NULL) {
@@ -1276,11 +1333,6 @@ static int build_default_root(void)
 	export->PrefWrite = FSAL_MAXIOSIZE;
 	export->PrefRead = FSAL_MAXIOSIZE;
 	export->PrefReaddir = 16384;
-	glist_init(&export->exp_state_list);
-	glist_init(&export->exp_lock_list);
-	glist_init(&export->exp_nlm_share_list);
-	glist_init(&export->mounted_exports_list);
-	glist_init(&export->clients);
 
 	/* Default anonymous uid and gid */
 	export->export_perms.anonymous_uid = (uid_t) ANON_UID;
@@ -1323,9 +1375,10 @@ static int build_default_root(void)
 	} else {
 		fsal_status_t rc;
 
-		rc = fsal_hdl->ops->create_export(fsal_hdl,
-						  NULL,
-						  &fsal_up_top);
+		rc = fsal_hdl->m_ops.create_export(fsal_hdl,
+						   NULL,
+						   err_type,
+						   &fsal_up_top);
 
 		if (FSAL_IS_ERROR(rc)) {
 			fsal_put(fsal_hdl);
@@ -1341,26 +1394,26 @@ static int build_default_root(void)
 	export->fsal_export = root_op_context.req_ctx.fsal_export;
 
 	if (!insert_gsh_export(export)) {
-		export->fsal_export->ops->release(export->fsal_export);
+		export->fsal_export->exp_ops.release(export->fsal_export);
 		fsal_put(fsal_hdl);
 		LogCrit(COMPONENT_CONFIG,
 			"Failed to insert pseudo root   In use??");
 		goto err_out;
 	}
-	set_gsh_export_state(export, EXPORT_READY);
 
 	/* This export must be mounted to the PseudoFS */
 	export_add_to_mount_work(export);
 
-	LogEvent(COMPONENT_CONFIG,
-		 "Export 0 (/) successfully created");
+	LogInfo(COMPONENT_CONFIG,
+		"Export 0 (/) successfully created");
 
 	put_gsh_export(export);	/* all done, let go */
-
+	release_root_op_context();
 	return 1;
 
 err_out:
 	free_export(export);
+	release_root_op_context();
 	return -1;
 }
 
@@ -1373,33 +1426,38 @@ err_out:
  *         the number of export entries else.
  */
 
-int ReadExports(config_file_t in_config)
+int ReadExports(config_file_t in_config,
+		struct config_error_type *err_type)
 {
-	struct config_error_type err_type;
-	int rc, ret = 0;
+	int rc, num_exp;
 
 	rc = load_config_from_parse(in_config,
 				    &export_defaults_param,
 				    NULL,
 				    false,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type))
+				    err_type);
+	if (rc < 0) {
+		LogCrit(COMPONENT_CONFIG, "Export defaults block error");
 		return -1;
+	}
 
-	rc = load_config_from_parse(in_config,
+	num_exp = load_config_from_parse(in_config,
 				    &export_param,
 				    NULL,
 				    false,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type))
-		return -1;
-	ret = build_default_root();
-	if (ret < 0) {
-		LogCrit(COMPONENT_CONFIG,
-			"No pseudo root!");
+				    err_type);
+	if (num_exp < 0) {
+		LogCrit(COMPONENT_CONFIG, "Export block error");
 		return -1;
 	}
-	return rc + ret;
+
+	rc = build_default_root(err_type);
+	if (rc < 0) {
+		LogCrit(COMPONENT_CONFIG, "No pseudo root!");
+		return -1;
+	}
+
+	return num_exp;
 }
 
 static void FreeClientList(struct glist_head *clients)
@@ -1438,7 +1496,7 @@ void free_export_resources(struct gsh_export *export)
 	FreeClientList(&export->clients);
 	if (export->fsal_export != NULL) {
 		struct fsal_module *fsal = export->fsal_export->fsal;
-		export->fsal_export->ops->release(export->fsal_export);
+		export->fsal_export->exp_ops.release(export->fsal_export);
 		fsal_put(fsal);
 	}
 	export->fsal_export = NULL;
@@ -1455,11 +1513,12 @@ void free_export_resources(struct gsh_export *export)
  * @brief pkginit callback to initialize exports from nfs_init
  *
  * Assumes being called with the export_by_id.lock held.
+ * true on success
  */
 
 static bool init_export_cb(struct gsh_export *exp, void *state)
 {
-	return init_export_root(exp);
+	return !(init_export_root(exp));
 }
 
 /**
@@ -1469,30 +1528,6 @@ static bool init_export_cb(struct gsh_export *exp, void *state)
 void exports_pkginit(void)
 {
 	foreach_gsh_export(init_export_cb, NULL);
-}
-
-/**
- * @brief Function to be called from cache_inode_get_protected to get an
- * export's root entry.
- *
- * @param entry  [IN/OUT] call by ref pointer to store cache entry
- * @param source [IN] void pointer to the export
- *
- * @return cache inode status code
- * @retval CACHE_INODE_FSAL_ESTALE indicates this export no longer has a root
- * entry
- */
-
-cache_inode_status_t export_get_root_entry(cache_entry_t **entry, void *source)
-{
-	struct gsh_export *export = source;
-
-	*entry = export->exp_root_cache_inode;
-
-	if (unlikely((*entry) == NULL))
-		return CACHE_INODE_FSAL_ESTALE;
-	else
-		return CACHE_INODE_SUCCESS;
 }
 
 /**
@@ -1512,10 +1547,19 @@ cache_inode_status_t export_get_root_entry(cache_entry_t **entry, void *source)
 cache_inode_status_t nfs_export_get_root_entry(struct gsh_export *export,
 					       cache_entry_t **entry)
 {
-	return cache_inode_get_protected(entry,
-					 &export->lock,
-					 export_get_root_entry,
-					 export);
+	cache_inode_status_t status;
+
+	PTHREAD_RWLOCK_rdlock(&export->lock);
+
+	status =
+	    cache_inode_lru_ref(export->exp_root_cache_inode, LRU_FLAG_NONE);
+
+	if (status == CACHE_INODE_SUCCESS)
+		*entry = export->exp_root_cache_inode;
+
+	PTHREAD_RWLOCK_unlock(&export->lock);
+
+	return status;
 }
 
 /**
@@ -1525,17 +1569,17 @@ cache_inode_status_t nfs_export_get_root_entry(struct gsh_export *export,
  *
  * @param exp [IN] the export
  *
- * @return true if successful.
+ * @return 0 if successful otherwise err.
  */
 
-bool init_export_root(struct gsh_export *export)
+int init_export_root(struct gsh_export *export)
 {
 	fsal_status_t fsal_status;
 	cache_inode_status_t cache_status;
 	struct fsal_obj_handle *root_handle;
 	cache_entry_t *entry = NULL;
 	struct root_op_context root_op_context;
-	bool my_status = false;
+	int my_status;
 
 	/* Initialize req_ctx */
 	init_root_op_context(&root_op_context, export, export->fsal_export,
@@ -1546,11 +1590,13 @@ bool init_export_root(struct gsh_export *export)
 		 "About to lookup_path for ExportId=%u Path=%s",
 		 export->export_id, export->fullpath);
 	fsal_status =
-	    export->fsal_export->ops->lookup_path(export->fsal_export,
+	    export->fsal_export->exp_ops.lookup_path(export->fsal_export,
 						  export->fullpath,
 						  &root_handle);
 
 	if (FSAL_IS_ERROR(fsal_status)) {
+		my_status = EINVAL;
+
 		LogCrit(COMPONENT_EXPORT,
 			"Lookup failed on path, ExportId=%u Path=%s FSAL_ERROR=(%s,%u)",
 			export->export_id, export->fullpath,
@@ -1565,6 +1611,9 @@ bool init_export_root(struct gsh_export *export)
 					     &entry);
 
 	if (entry == NULL) {
+		/* EFAULT for any internal error */
+		my_status = EFAULT;
+
 		LogCrit(COMPONENT_EXPORT,
 			"Error when creating root cached entry for %s, export_id=%d, cache_status=%s",
 			export->fullpath,
@@ -1577,6 +1626,9 @@ bool init_export_root(struct gsh_export *export)
 	cache_status = cache_inode_inc_pin_ref(entry);
 
 	if (cache_status != CACHE_INODE_SUCCESS) {
+
+		my_status = EFAULT;
+
 		LogCrit(COMPONENT_EXPORT,
 			"Error when creating root cached entry for %s, export_id=%d, cache_status=%s",
 			export->fullpath,
@@ -1616,7 +1668,7 @@ bool init_export_root(struct gsh_export *export)
 
 	/* Release the LRU reference and return success. */
 	cache_inode_put(entry);
-	my_status = true;
+	my_status = 0;
 out:
 	release_root_op_context();
 	return my_status;
@@ -1628,17 +1680,12 @@ out:
  * @param exp [IN] the export
  */
 
-#define RELEASE_EXP_ROOT_FLAG_NONE		0x0000
-#define RELEASE_EXP_ROOT_FLAG_ULOCK_ATTR	0x0001
-#define RELEASE_EXP_ROOT_FLAG_ULOCK_LOCK	0x0002
-#define RELEASE_EXP_ROOT_FLAG_ULOCK_BOTH \
-	(RELEASE_EXP_ROOT_FLAG_ULOCK_ATTR|RELEASE_EXP_ROOT_FLAG_ULOCK_LOCK)
-
 static inline void
-release_export_root_locked(struct gsh_export *export,
-			   cache_entry_t *entry, uint32_t flags)
+release_export_root_locked(struct gsh_export *export, cache_entry_t *entry)
 {
 	cache_entry_t *root_entry = NULL;
+
+	PTHREAD_RWLOCK_wrlock(&export->lock);
 
 	glist_del(&export->exp_root_list);
 	root_entry = export->exp_root_cache_inode;
@@ -1646,18 +1693,19 @@ release_export_root_locked(struct gsh_export *export,
 
 	if (root_entry != NULL) {
 		/* Allow this entry to be removed (unlink) */
-		(void)atomic_dec_int32_t(&entry->exp_root_refcount);
+		(void) atomic_dec_int32_t(&entry->exp_root_refcount);
 
 		/* We must not hold entry->attr_lock across
-		 * cache_inode_dec_pin_ref (LRU lane lock order) */
-		if (flags & RELEASE_EXP_ROOT_FLAG_ULOCK_ATTR)
-			PTHREAD_RWLOCK_unlock(&entry->attr_lock);
-
-		if (flags & RELEASE_EXP_ROOT_FLAG_ULOCK_LOCK)
-			PTHREAD_RWLOCK_unlock(&export->lock);
+		 * cache_inode_dec_pin_ref (LRU lane lock order)
+		 */
+		PTHREAD_RWLOCK_unlock(&entry->attr_lock);
+		PTHREAD_RWLOCK_unlock(&export->lock);
 
 		/* Release the pin reference */
 		cache_inode_dec_pin_ref(root_entry, false);
+	} else {
+		PTHREAD_RWLOCK_unlock(&entry->attr_lock);
+		PTHREAD_RWLOCK_unlock(&export->lock);
 	}
 
 	LogDebug(COMPONENT_EXPORT,
@@ -1690,13 +1738,24 @@ void release_export_root(struct gsh_export *export)
 	}
 
 	PTHREAD_RWLOCK_wrlock(&entry->attr_lock);
-	PTHREAD_RWLOCK_wrlock(&export->lock);
 
 	/* Make the export unreachable as a root cache inode */
-	release_export_root_locked(export, entry,
-				   RELEASE_EXP_ROOT_FLAG_ULOCK_BOTH);
+	release_export_root_locked(export, entry);
 
 	cache_inode_put(entry);
+}
+
+static inline void clean_up_export(struct gsh_export *export)
+{
+	/* Make export unreachable */
+	pseudo_unmount_export(export);
+	remove_gsh_export(export->export_id);
+
+	/* Release state belonging to this export */
+	state_release_export(export);
+
+	/* Flush cache inodes belonging to this export */
+	cache_inode_unexport(export);
 }
 
 void unexport(struct gsh_export *export)
@@ -1705,9 +1764,8 @@ void unexport(struct gsh_export *export)
 	LogDebug(COMPONENT_EXPORT,
 		 "Unexport %s, Pseduo %s",
 		 export->fullpath, export->pseudopath);
-	pseudo_unmount_export(export);
-	remove_gsh_export(export->export_id);
 	release_export_root(export);
+	clean_up_export(export);
 }
 
 /**
@@ -1740,15 +1798,11 @@ void kill_export_root_entry(cache_entry_t *entry)
 			"Killing export_id %d because root entry went bad",
 			export->export_id);
 
-		PTHREAD_RWLOCK_wrlock(&export->lock);
-
 		/* Make the export unreachable as a root cache inode */
-		release_export_root_locked(
-			export, entry, RELEASE_EXP_ROOT_FLAG_ULOCK_BOTH);
+		release_export_root_locked(export, entry);
 
-		/* Make the export otherwise unreachable */
-		pseudo_unmount_export(export);
-		remove_gsh_export(export->export_id);
+		/* Make the export otherwise unreachable and clean it up */
+		clean_up_export(export);
 
 		put_gsh_export(export);
 	}
@@ -1804,7 +1858,7 @@ void kill_export_junction_entry(cache_entry_t *entry)
 }
 
 static char *client_types[] = {
-	[RAW_CLIENT_LIST] = "RAW_CLIENT_LIST",
+	[PROTO_CLIENT] = "PROTO_CLIENT",
 	[HOSTIF_CLIENT] = "HOSTIF_CLIENT",
 	[NETWORK_CLIENT] = "NETWORK_CLIENT",
 	[NETGROUP_CLIENT] = "NETGROUP_CLIENT",
@@ -1864,22 +1918,15 @@ static exportlist_client_entry_t *client_match(sockaddr_t *hostaddr,
 			rc = nfs_ip_name_get(hostaddr, hostname,
 					     sizeof(hostname));
 
-			if (rc != IP_NAME_SUCCESS) {
-				if (rc == IP_NAME_NOT_FOUND) {
-					/* IPaddr was not cached, add it to the
-					 * cache
-					 */
-					if (nfs_ip_name_add(hostaddr,
-							    hostname,
-							    sizeof(hostname))
-					    != IP_NAME_SUCCESS) {
-						/* Major failure, name not
-						 * be resolved
-						 */
-						break;
-					}
-				}
+			if (rc == IP_NAME_NOT_FOUND) {
+				/* IPaddr was not cached, add it to the cache */
+				rc = nfs_ip_name_add(hostaddr,
+						     hostname,
+						     sizeof(hostname));
 			}
+
+			if (rc != IP_NAME_SUCCESS)
+				break; /* Fatal failure */
 
 			/* At this point 'hostname' should contain the
 			 * name that was found
@@ -1908,25 +1955,21 @@ static exportlist_client_entry_t *client_match(sockaddr_t *hostaddr,
 			rc = nfs_ip_name_get(hostaddr, hostname,
 					     sizeof(hostname));
 
-			if (rc != IP_NAME_SUCCESS) {
-				if (rc == IP_NAME_NOT_FOUND) {
-					/* IPaddr was not cached, add it to
-					 * the cache
-					 */
-					if (nfs_ip_name_add(hostaddr,
-							    hostname,
-							    sizeof(hostname))
-					    != IP_NAME_SUCCESS) {
-						/* Major failure, name could
-						 * not be resolved
-						 */
-/** @todo this change from 1.5 is not IPv6 useful.
- * come back to this and use the string from client mgr inside req_ctx...
- */
-						break;
-					}
-				}
+			if (rc == IP_NAME_NOT_FOUND) {
+				/* IPaddr was not cached, add it to the cache */
+
+				/** @todo this change from 1.5 is not IPv6
+				 * useful.  come back to this and use the
+				 * string from client mgr inside req_ctx...
+				 */
+				rc = nfs_ip_name_add(hostaddr,
+						     hostname,
+						     sizeof(hostname));
 			}
+
+			if (rc != IP_NAME_SUCCESS)
+					break;
+
 			/* At this point 'hostname' should contain the
 			 * name that was found
 			 */
@@ -2163,8 +2206,8 @@ sockaddr_t *convert_ipv6_to_ipv4(sockaddr_t *ipv6, sockaddr_t *ipv4)
 			char ipstring4[SOCK_NAME_MAX];
 			char ipstring6[SOCK_NAME_MAX];
 
-			sprint_sockaddr(ipv6, ipstring6, sizeof(ipstring6));
-			sprint_sockaddr(ipv4, ipstring4, sizeof(ipstring4));
+			sprint_sockip(ipv6, ipstring6, sizeof(ipstring6));
+			sprint_sockip(ipv4, ipstring4, sizeof(ipstring4));
 			LogMidDebug(COMPONENT_EXPORT,
 				    "Converting IPv6 encapsulated IPv4 address %s to IPv4 %s",
 				    ipstring6, ipstring4);

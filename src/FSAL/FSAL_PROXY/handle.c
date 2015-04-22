@@ -32,12 +32,14 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/poll.h>
-#include "ganesha_list.h"
+#include <netdb.h>
+#include "gsh_list.h"
 #include "abstract_atomic.h"
 #include "fsal_types.h"
 #include "FSAL/fsal_commonlib.h"
 #include "pxy_fsal_methods.h"
 #include "fsal_nfsv4_macros.h"
+#include "nfs_core.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
 #include "export_mgr.h"
@@ -345,7 +347,7 @@ static int pxy_got_rpc_reply(struct pxy_rpc_io_context *ctx, int sock, int sz,
 	if (sz > ctx->recvbuf_sz)
 		return -E2BIG;
 
-	pthread_mutex_lock(&ctx->iolock);
+	PTHREAD_MUTEX_lock(&ctx->iolock);
 	memcpy(repbuf, &xid, sizeof(xid));
 	/*
 	 * sz includes 4 bytes of xid which have been processed
@@ -371,7 +373,7 @@ static int pxy_got_rpc_reply(struct pxy_rpc_io_context *ctx, int sock, int sz,
 	ctx->iodone = 1;
 	size = ctx->ioresult;
 	pthread_cond_signal(&ctx->iowait);
-	pthread_mutex_unlock(&ctx->iolock);
+	PTHREAD_MUTEX_unlock(&ctx->iolock);
 	return size;
 }
 
@@ -400,18 +402,18 @@ static int pxy_rpc_read_reply(int sock)
 	LogDebug(COMPONENT_FSAL, "Recmark %x, xid %u\n", h.recmark, h.xid);
 	h.recmark &= ~(1U << 31);
 
-	pthread_mutex_lock(&listlock);
+	PTHREAD_MUTEX_lock(&listlock);
 	glist_for_each(c, &rpc_calls) {
 		struct pxy_rpc_io_context *ctx =
 		    container_of(c, struct pxy_rpc_io_context, calls);
 
 		if (ctx->rpc_xid == h.xid) {
 			glist_del(c);
-			pthread_mutex_unlock(&listlock);
+			PTHREAD_MUTEX_unlock(&listlock);
 			return pxy_got_rpc_reply(ctx, sock, h.recmark, h.xid);
 		}
 	}
-	pthread_mutex_unlock(&listlock);
+	PTHREAD_MUTEX_unlock(&listlock);
 
 	cnt = h.recmark - 4;
 	LogDebug(COMPONENT_FSAL, "xid %u is not on the list, skip %d bytes\n",
@@ -444,15 +446,15 @@ static void pxy_new_socket_ready(void)
 
 		glist_del(c);
 
-		pthread_mutex_lock(&ctx->iolock);
+		PTHREAD_MUTEX_lock(&ctx->iolock);
 		ctx->iodone = 1;
 		ctx->ioresult = -EAGAIN;
 		pthread_cond_signal(&ctx->iowait);
-		pthread_mutex_unlock(&ctx->iolock);
+		PTHREAD_MUTEX_unlock(&ctx->iolock);
 	}
 }
 
-static int pxy_connect(const proxyfs_specific_initinfo_t *info,
+static int pxy_connect(struct pxy_client_params *info,
 		       struct sockaddr_in *dest)
 {
 	int sock;
@@ -487,7 +489,7 @@ static int pxy_connect(const proxyfs_specific_initinfo_t *info,
  */
 static void *pxy_rpc_recv(void *arg)
 {
-	const proxyfs_specific_initinfo_t *info = arg;
+	struct pxy_client_params *info = arg;
 	struct sockaddr_in addr_rpc;
 	struct sockaddr_in *info_sock = (struct sockaddr_in *)&info->srv_addr;
 	char addr[INET_ADDRSTRLEN];
@@ -502,7 +504,7 @@ static void *pxy_rpc_recv(void *arg)
 
 	for (;;) {
 		int nsleeps = 0;
-		pthread_mutex_lock(&listlock);
+		PTHREAD_MUTEX_lock(&listlock);
 		do {
 			rpc_sock = pxy_connect(info, &addr_rpc);
 			if (rpc_sock < 0) {
@@ -514,10 +516,10 @@ static void *pxy_rpc_recv(void *arg)
 							  addr,
 							  sizeof(addr)),
 						ntohs(info->srv_port));
-				pthread_mutex_unlock(&listlock);
+				PTHREAD_MUTEX_unlock(&listlock);
 				sleep(info->retry_sleeptime);
 				nsleeps++;
-				pthread_mutex_lock(&listlock);
+				PTHREAD_MUTEX_lock(&listlock);
 			} else {
 				LogDebug(COMPONENT_FSAL,
 					 "Connected after %d sleeps, "
@@ -525,7 +527,7 @@ static void *pxy_rpc_recv(void *arg)
 					 nsleeps);
 			}
 		} while (rpc_sock < 0);
-		pthread_mutex_unlock(&listlock);
+		PTHREAD_MUTEX_unlock(&listlock);
 
 		pfd.fd = rpc_sock;
 		pfd.events = POLLIN | POLLRDHUP;
@@ -555,10 +557,10 @@ static void *pxy_rpc_recv(void *arg)
 				break;
 			}
 
-			pthread_mutex_lock(&listlock);
+			PTHREAD_MUTEX_lock(&listlock);
 			close(rpc_sock);
 			rpc_sock = -1;
-			pthread_mutex_unlock(&listlock);
+			PTHREAD_MUTEX_unlock(&listlock);
 		}
 	}
 
@@ -571,20 +573,20 @@ static enum clnt_stat pxy_process_reply(struct pxy_rpc_io_context *ctx,
 	enum clnt_stat rc = RPC_CANTRECV;
 	struct timespec ts;
 
-	pthread_mutex_lock(&ctx->iolock);
+	PTHREAD_MUTEX_lock(&ctx->iolock);
 	ts.tv_sec = time(NULL) + 60;
 	ts.tv_nsec = 0;
 
 	while (!ctx->iodone) {
 		int w = pthread_cond_timedwait(&ctx->iowait, &ctx->iolock, &ts);
 		if (w == ETIMEDOUT) {
-			pthread_mutex_unlock(&ctx->iolock);
+			PTHREAD_MUTEX_unlock(&ctx->iolock);
 			return RPC_TIMEDOUT;
 		}
 	}
 
 	ctx->iodone = 0;
-	pthread_mutex_unlock(&ctx->iolock);
+	PTHREAD_MUTEX_unlock(&ctx->iolock);
 
 	if (ctx->ioresult > 0) {
 		struct rpc_msg reply;
@@ -651,10 +653,10 @@ static enum clnt_stat pxy_process_reply(struct pxy_rpc_io_context *ctx,
 
 static void pxy_rpc_need_sock(void)
 {
-	pthread_mutex_lock(&listlock);
+	PTHREAD_MUTEX_lock(&listlock);
 	while (rpc_sock < 0)
 		pthread_cond_wait(&sockless, &listlock);
-	pthread_mutex_unlock(&listlock);
+	PTHREAD_MUTEX_unlock(&listlock);
 }
 
 static int pxy_rpc_renewer_wait(int timeout)
@@ -662,12 +664,12 @@ static int pxy_rpc_renewer_wait(int timeout)
 	struct timespec ts;
 	int rc;
 
-	pthread_mutex_lock(&listlock);
+	PTHREAD_MUTEX_lock(&listlock);
 	ts.tv_sec = time(NULL) + timeout;
 	ts.tv_nsec = 0;
 
 	rc = pthread_cond_timedwait(&sockless, &listlock, &ts);
-	pthread_mutex_unlock(&listlock);
+	PTHREAD_MUTEX_unlock(&listlock);
 	return (rc == ETIMEDOUT);
 }
 
@@ -680,9 +682,9 @@ static int pxy_compoundv4_call(struct pxy_rpc_io_context *pcontext,
 	AUTH *au;
 	enum clnt_stat rc;
 
-	pthread_mutex_lock(&listlock);
+	PTHREAD_MUTEX_lock(&listlock);
 	rmsg.rm_xid = rpc_xid++;
-	pthread_mutex_unlock(&listlock);
+	PTHREAD_MUTEX_unlock(&listlock);
 	rmsg.rm_direction = CALL;
 
 	rmsg.rm_call.cb_rpcvers = RPC_MSG_VERSION;
@@ -722,7 +724,7 @@ static int pxy_compoundv4_call(struct pxy_rpc_io_context *pcontext,
 			LogDebug(COMPONENT_FSAL, "%ssend XID %u with %d bytes",
 				 (first_try ? "First attempt to " : "Re"),
 				 rmsg.rm_xid, pos);
-			pthread_mutex_lock(&listlock);
+			PTHREAD_MUTEX_lock(&listlock);
 			while (bc < pos) {
 				int wc = write(rpc_sock, buf, pos - bc);
 				if (wc <= 0) {
@@ -743,7 +745,7 @@ static int pxy_compoundv4_call(struct pxy_rpc_io_context *pcontext,
 				if (!first_try)
 					glist_del(&pcontext->calls);
 			}
-			pthread_mutex_unlock(&listlock);
+			PTHREAD_MUTEX_unlock(&listlock);
 
 			if (bc == pos)
 				rc = pxy_process_reply(pcontext, res);
@@ -773,13 +775,13 @@ int pxy_compoundv4_execute(const char *caller, const struct user_cred *creds,
 		.resarray.resarray_len = cnt
 	};
 
-	pthread_mutex_lock(&context_lock);
+	PTHREAD_MUTEX_lock(&context_lock);
 	while (glist_empty(&free_contexts))
 		pthread_cond_wait(&need_context, &context_lock);
 	ctx =
 	    glist_first_entry(&free_contexts, struct pxy_rpc_io_context, calls);
 	glist_del(&ctx->calls);
-	pthread_mutex_unlock(&context_lock);
+	PTHREAD_MUTEX_unlock(&context_lock);
 
 	do {
 		rc = pxy_compoundv4_call(ctx, creds, &arg, &res);
@@ -791,10 +793,10 @@ int pxy_compoundv4_execute(const char *caller, const struct user_cred *creds,
 	} while ((rc == RPC_CANTRECV && (ctx->ioresult == -EAGAIN))
 		 || (rc == RPC_CANTSEND));
 
-	pthread_mutex_lock(&context_lock);
+	PTHREAD_MUTEX_lock(&context_lock);
 	pthread_cond_signal(&need_context);
 	glist_add(&free_contexts, &ctx->calls);
-	pthread_mutex_unlock(&context_lock);
+	PTHREAD_MUTEX_unlock(&context_lock);
 
 	if (rc == RPC_SUCCESS)
 		return res.status;
@@ -806,9 +808,9 @@ int pxy_compoundv4_execute(const char *caller, const struct user_cred *creds,
 
 void pxy_get_clientid(clientid4 *ret)
 {
-	pthread_mutex_lock(&pxy_clientid_mutex);
+	PTHREAD_MUTEX_lock(&pxy_clientid_mutex);
 	*ret = pxy_clientid;
-	pthread_mutex_unlock(&pxy_clientid_mutex);
+	PTHREAD_MUTEX_unlock(&pxy_clientid_mutex);
 }
 
 static int pxy_setclientid(clientid4 *resultclientid, uint32_t *lease_time)
@@ -918,9 +920,9 @@ static void *pxy_clientid_renewer(void *Arg)
 		pxy_rpc_need_sock();
 		needed = pxy_setclientid(&newcid, &lease_time);
 		if (!needed) {
-			pthread_mutex_lock(&pxy_clientid_mutex);
+			PTHREAD_MUTEX_lock(&pxy_clientid_mutex);
 			pxy_clientid = newcid;
-			pthread_mutex_unlock(&pxy_clientid_mutex);
+			PTHREAD_MUTEX_unlock(&pxy_clientid_mutex);
 		}
 	}
 	return NULL;
@@ -951,10 +953,10 @@ int pxy_init_rpc(const struct pxy_fsal_module *pm)
  *       there is work to do to get this fnctn to truely be
  *       per export.
  */
-	pthread_mutex_lock(&listlock);
+	PTHREAD_MUTEX_lock(&listlock);
 	if (rpc_xid == 0)
 		rpc_xid = getpid() ^ time(NULL);
-	pthread_mutex_unlock(&listlock);
+	PTHREAD_MUTEX_unlock(&listlock);
 	if (gethostname(pxy_hostname, sizeof(pxy_hostname)))
 		strncpy(pxy_hostname, "NFS-GANESHA/Proxy",
 			sizeof(pxy_hostname));
@@ -967,8 +969,8 @@ int pxy_init_rpc(const struct pxy_fsal_module *pm)
 			free_io_contexts();
 			return ENOMEM;
 		}
-		pthread_mutex_init(&c->iolock, NULL);
-		pthread_cond_init(&c->iowait, NULL);
+		PTHREAD_MUTEX_init(&c->iolock, NULL);
+		PTHREAD_COND_init(&c->iowait, NULL);
 		c->nfs_prog = pm->special.srv_prognum;
 		c->sendbuf_sz = pm->special.srv_sendsize;
 		c->recvbuf_sz = pm->special.srv_recvsize;
@@ -1103,7 +1105,9 @@ static fsal_status_t pxy_lookup(struct fsal_obj_handle *parent,
 }
 
 static fsal_status_t pxy_do_close(const struct user_cred *creds,
-				  const nfs_fh4 *fh4, stateid4 *sid,
+				  const nfs_fh4 *fh4,
+				  seqid4 open_owner_seqid,
+				  stateid4 *sid,
 				  struct fsal_export *exp)
 {
 	int rc;
@@ -1119,17 +1123,18 @@ static fsal_status_t pxy_do_close(const struct user_cred *creds,
 		return fsalstat(ERR_FSAL_NO_ERROR, 0);
 
 	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, *fh4);
-	COMPOUNDV4_ARG_ADD_OP_CLOSE(opcnt, argoparray, sid);
+	COMPOUNDV4_ARG_ADD_OP_CLOSE(opcnt, argoparray, sid, open_owner_seqid);
 
 	rc = pxy_nfsv4_call(exp, creds, opcnt, argoparray, resoparray);
 	if (rc != NFS4_OK)
 		return nfsstat4_to_fsal(rc);
-	sid->seqid++;
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 static fsal_status_t pxy_open_confirm(const struct user_cred *cred,
-				      const nfs_fh4 *fh4, stateid4 *stateid,
+				      const nfs_fh4 *fh4,
+				      seqid4 open_owner_seqid,
+				      stateid4 *stateid,
 				      struct fsal_export *export)
 {
 	int rc;
@@ -1151,7 +1156,7 @@ static fsal_status_t pxy_open_confirm(const struct user_cred *cred,
 	op->nfs_argop4_u.opopen_confirm.open_stateid.seqid = stateid->seqid;
 	memcpy(op->nfs_argop4_u.opopen_confirm.open_stateid.other,
 	       stateid->other, 12);
-	op->nfs_argop4_u.opopen_confirm.seqid = stateid->seqid + 1;
+	op->nfs_argop4_u.opopen_confirm.seqid = open_owner_seqid;
 
 	rc = pxy_nfsv4_call(export, cred, opcnt, argoparray, resoparray);
 	if (rc != NFS4_OK)
@@ -1179,6 +1184,7 @@ static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 	nfs_resop4 resoparray[FSAL_CREATE_NB_OP_ALLOC];
 	char owner_val[128];
 	unsigned int owner_len = 0;
+	seqid4 open_owner_seqid = 0;
 	GETFH4resok *fhok;
 	GETATTR4resok *atok;
 	OPEN4resok *opok;
@@ -1203,7 +1209,7 @@ static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 	pxy_get_clientid(&cid);
 	COMPOUNDV4_ARG_ADD_OP_OPEN_CREATE(opcnt, argoparray, (char *)name,
 					  input_attr, cid, owner_val,
-					  owner_len);
+					  owner_len, open_owner_seqid);
 
 	fhok = &resoparray[opcnt].nfs_resop4_u.opgetfh.GETFH4res_u.resok4;
 	fhok->object.nfs_fh4_val = padfilehandle;
@@ -1224,7 +1230,7 @@ static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 	/* See if a OPEN_CONFIRM is required */
 	if (opok->rflags & OPEN4_RESULT_CONFIRM) {
 		st = pxy_open_confirm(op_ctx->creds, &fhok->object,
-				      &opok->stateid,
+				      ++open_owner_seqid, &opok->stateid,
 				      op_ctx->fsal_export);
 		if (FSAL_IS_ERROR(st))
 			return st;
@@ -1232,8 +1238,8 @@ static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 
 	/* The created file is still opened, to preserve the correct
 	 * seqid for later use, we close it */
-	st = pxy_do_close(op_ctx->creds, &fhok->object, &opok->stateid,
-			  op_ctx->fsal_export);
+	st = pxy_do_close(op_ctx->creds, &fhok->object, ++open_owner_seqid,
+			  &opok->stateid, op_ctx->fsal_export);
 	if (FSAL_IS_ERROR(st))
 		return st;
 	st = pxy_make_object(op_ctx->fsal_export,
@@ -1407,7 +1413,7 @@ static fsal_status_t pxy_symlink(struct fsal_obj_handle *dir_hdl,
 	struct pxy_obj_handle *ph;
 
 	/* Tests if symlinking is allowed by configuration. */
-	if (!op_ctx->fsal_export->ops->fs_supports(op_ctx->fsal_export,
+	if (!op_ctx->fsal_export->exp_ops.fs_supports(op_ctx->fsal_export,
 						  fso_symlink_support))
 		return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
 
@@ -1507,7 +1513,7 @@ static fsal_status_t pxy_link(struct fsal_obj_handle *obj_hdl,
 	int opcnt = 0;
 
 	/* Tests if hardlinking is allowed by configuration. */
-	if (!op_ctx->fsal_export->ops->fs_supports(op_ctx->fsal_export,
+	if (!op_ctx->fsal_export->exp_ops.fs_supports(op_ctx->fsal_export,
 						  fso_link_support))
 		return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
 
@@ -1608,7 +1614,8 @@ static fsal_status_t pxy_readdir(struct fsal_obj_handle *dir_hdl,
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
-static fsal_status_t pxy_rename(struct fsal_obj_handle *olddir_hdl,
+static fsal_status_t pxy_rename(struct fsal_obj_handle *obj_hdl,
+				struct fsal_obj_handle *olddir_hdl,
 				const char *old_name,
 				struct fsal_obj_handle *newdir_hdl,
 				const char *new_name)
@@ -1701,7 +1708,7 @@ static fsal_status_t pxy_setattrs(struct fsal_obj_handle *obj_hdl,
 	nfs_resop4 resoparray[FSAL_SETATTR_NB_OP_ALLOC];
 
 	if (FSAL_TEST_MASK(attrs->mask, ATTR_MODE))
-		attrs->mode &= ~op_ctx->fsal_export->ops->
+		attrs->mode &= ~op_ctx->fsal_export->exp_ops.
 				fs_umask(op_ctx->fsal_export);
 
 	ph = container_of(obj_hdl, struct pxy_obj_handle, obj);
@@ -1826,7 +1833,7 @@ static void pxy_hdl_release(struct fsal_obj_handle *obj_hdl)
 	struct pxy_obj_handle *ph =
 	    container_of(obj_hdl, struct pxy_obj_handle, obj);
 
-	fsal_obj_handle_uninit(obj_hdl);
+	fsal_obj_handle_fini(obj_hdl);
 
 	gsh_free(ph);
 }
@@ -1852,10 +1859,19 @@ static fsal_status_t pxy_open(struct fsal_obj_handle *obj_hdl,
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
+static fsal_openflags_t pxy_status(struct fsal_obj_handle *obj_hdl)
+{
+	struct pxy_obj_handle *ph;
+
+	ph = container_of(obj_hdl, struct pxy_obj_handle, obj);
+	return ph->openflags;
+}
+
 static fsal_status_t pxy_read(struct fsal_obj_handle *obj_hdl,
 			      uint64_t offset, size_t buffer_size, void *buffer,
 			      size_t *read_amount, bool *end_of_file)
 {
+	int mr;
 	int rc;
 	int opcnt = 0;
 	struct pxy_obj_handle *ph;
@@ -1876,10 +1892,9 @@ static fsal_status_t pxy_read(struct fsal_obj_handle *obj_hdl,
 		return fsalstat(ERR_FSAL_FILE_OPEN, EBADF);
 #endif
 
-	if (buffer_size >
-	    op_ctx->fsal_export->ops->fs_maxread(op_ctx->fsal_export))
-		buffer_size =
-		    op_ctx->fsal_export->ops->fs_maxread(op_ctx->fsal_export);
+	mr = op_ctx->fsal_export->exp_ops.fs_maxread(op_ctx->fsal_export);
+	if (buffer_size > mr)
+		buffer_size = mr;
 
 	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, ph->fh4);
 	rok = &resoparray[opcnt].nfs_resop4_u.opread.READ4res_u.resok4;
@@ -1901,6 +1916,7 @@ static fsal_status_t pxy_write(struct fsal_obj_handle *obj_hdl,
 			       uint64_t offset, size_t size, void *buffer,
 			       size_t *write_amount, bool *fsal_stable)
 {
+	int mw;
 	int rc;
 	int opcnt = 0;
 #define FSAL_WRITE_NB_OP_ALLOC 2
@@ -1922,10 +1938,10 @@ static fsal_status_t pxy_write(struct fsal_obj_handle *obj_hdl,
 	}
 #endif
 
-	if (size >
-	    op_ctx->fsal_export->ops->fs_maxwrite(op_ctx->fsal_export))
-		size =
-		    op_ctx->fsal_export->ops->fs_maxwrite(op_ctx->fsal_export);
+	mw = op_ctx->fsal_export->exp_ops.fs_maxwrite(op_ctx->fsal_export);
+	if (size > mw)
+		size = mw;
+
 	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, ph->fh4);
 	wok = &resoparray[opcnt].nfs_resop4_u.opwrite.WRITE4res_u.resok4;
 	COMPOUNDV4_ARG_ADD_OP_WRITE(opcnt, argoparray, offset, buffer, size);
@@ -1979,6 +1995,7 @@ void pxy_handle_ops_init(struct fsal_obj_ops *ops)
 	ops->rename = pxy_rename;
 	ops->unlink = pxy_unlink;
 	ops->open = pxy_open;
+	ops->status = pxy_status;
 	ops->read = pxy_read;
 	ops->write = pxy_write;
 	ops->commit = pxy_commit;
@@ -2050,6 +2067,7 @@ static struct pxy_obj_handle *pxy_alloc_handle(struct fsal_export *exp,
 		}
 #endif
 		fsal_obj_handle_init(&n->obj, exp, attr->type);
+		pxy_handle_ops_init(&n->obj.obj_ops);
 	}
 	return n;
 }
@@ -2178,7 +2196,8 @@ fsal_status_t pxy_get_dynamic_info(struct fsal_export *exp_hdl,
  * can be used to identify the object */
 fsal_status_t pxy_extract_handle(struct fsal_export *exp_hdl,
 				 fsal_digesttype_t in_type,
-				 struct gsh_buffdesc *fh_desc)
+				 struct gsh_buffdesc *fh_desc,
+				 int flags)
 {
 	struct pxy_handle_blob *pxyblob;
 	size_t fh_size;

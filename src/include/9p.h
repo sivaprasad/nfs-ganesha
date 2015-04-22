@@ -29,11 +29,15 @@
 
 #ifndef _9P_H
 #define _9P_H
+
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/select.h>
-#include "fsal.h"
+
+#include "9p_types.h"
+#include "fsal_types.h"
 #include "cache_inode.h"
 
 #ifdef _USE_9P_RDMA
@@ -41,11 +45,6 @@
 #include <rdma/rdma_cma.h>
 #include "mooshika.h"
 #endif
-
-typedef uint8_t u8;
-typedef uint16_t u16;
-typedef uint32_t u32;
-typedef uint64_t u64;
 
 #define NB_PREALLOC_HASH_9P 100
 #define NB_PREALLOC_FID_9P  100
@@ -354,6 +353,8 @@ struct _9p_conn {
 	struct _9p_flush_bucket flush_buckets[FLUSH_BUCKETS];
 	unsigned long sequence;
 	pthread_mutex_t sock_lock;
+	struct sockaddr_storage addrpeer;
+	struct export_perms export_perms;
 	unsigned int msize;
 };
 
@@ -476,7 +477,7 @@ do {                                         \
  * Get a pointer where to copy data in the reply.
  * This leaves room in the reply for a u32 len header
  */
-#define _9p_getbuffertofill(__cursor) (((char *) (cursor)) + sizeof(u32))
+#define _9p_getbuffertofill(__cursor) (((char *) (__cursor)) + sizeof(u32))
 
 #define _9p_setinitptr(__cursor, __start, __reqtype) \
 do {                                                 \

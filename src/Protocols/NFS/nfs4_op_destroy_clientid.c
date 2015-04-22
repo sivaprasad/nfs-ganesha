@@ -64,16 +64,18 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 
 	resp->resop = NFS4_OP_DESTROY_CLIENTID;
 
-	if (data->minorversion < 1) {
-		res_DESTROY_CLIENTID4->dcr_status = NFS4ERR_NOTSUPP;
-		return res_DESTROY_CLIENTID4->dcr_status;
-	}
-
 	clientid = arg_DESTROY_CLIENTID4->dca_clientid;
 
-	LogDebug(COMPONENT_CLIENTID,
-		 "DESTROY_CLIENTID clientid=%" PRIx64,
-		 clientid);
+	if (isDebug(COMPONENT_CLIENTID)) {
+		char str[LOG_BUFF_LEN];
+		struct display_buffer dspbuf = {sizeof(str), str, str};
+
+		display_clientid(&dspbuf, clientid);
+
+		LogDebug(COMPONENT_CLIENTID,
+			 "DESTROY_CLIENTID clientid=%s",
+			 str);
+	}
 
 	res_DESTROY_CLIENTID4->dcr_status = NFS4_OK;
 
@@ -97,6 +99,8 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 		rc = nfs_client_id_get_confirmed(clientid, &conf);
 
 		if (rc == CLIENT_ID_SUCCESS) {
+			if (found != NULL)
+				dec_client_id_ref(found);
 			client_record = conf->cid_client_record;
 			found = conf;
 		}
@@ -109,12 +113,15 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 		goto out;
 	}
 
-	pthread_mutex_lock(&client_record->cr_mutex);
+	(void) inc_client_record_ref(client_record);
+
+	PTHREAD_MUTEX_lock(&client_record->cr_mutex);
 
 	if (isFullDebug(COMPONENT_CLIENTID)) {
-		char str[HASHTABLE_DISPLAY_STRLEN];
+		char str[LOG_BUFF_LEN];
+		struct display_buffer dspbuf = {sizeof(str), str, str};
 
-		display_client_record(client_record, str);
+		display_client_record(&dspbuf, client_record);
 
 		LogFullDebug(COMPONENT_CLIENTID,
 			     "Client Record %s cr_confirmed_rec=%p "
@@ -135,24 +142,29 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 		goto cleanup;
 	}
 
-	/* We MUST NOT destroy a clientid that has nfsv41 sessions or state.
-	 * Since the minorversion is 4.1 or higher, this is equivalent to a
-	 * session check.
-	 */
-	if (client_id_has_nfs41_sessions(found)) {
-		res_DESTROY_CLIENTID4->dcr_status = NFS4ERR_CLIENTID_BUSY;
-		goto cleanup;
-	}
-
 	if (conf) {
+		/* We MUST NOT destroy a clientid that has nfsv41 sessions or
+		 * state. Since the minorversion is 4.1 or higher, this is
+		 * equivalent to a session check.
+		 */
+		PTHREAD_MUTEX_lock(&conf->cid_mutex);
+		if (!glist_empty(&conf->cid_cb.v41.cb_session_list)) {
+			res_DESTROY_CLIENTID4->dcr_status =
+							NFS4ERR_CLIENTID_BUSY;
+			PTHREAD_MUTEX_unlock(&conf->cid_mutex);
+			goto cleanup;
+		}
+		PTHREAD_MUTEX_unlock(&conf->cid_mutex);
+
 		/* Delete the confirmed clientid record. Because we
 		 * have the cr_mutex, we have won any race to deal
 		 * with this clientid record.
 		 */
 		if (isFullDebug(COMPONENT_CLIENTID)) {
-			char str[HASHTABLE_DISPLAY_STRLEN];
+			char str[LOG_BUFF_LEN];
+			struct display_buffer dspbuf = {sizeof(str), str, str};
 
-			display_client_id_rec(conf, str);
+			display_client_id_rec(&dspbuf, conf);
 
 			LogDebug(COMPONENT_CLIENTID,
 				 "Removing confirmed clientid %s", str);
@@ -160,7 +172,6 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 
 		/* unhash the clientid record */
 		(void)remove_confirmed_client_id(conf);
-		conf = NULL;
 	}
 
 	if (unconf) {
@@ -169,9 +180,10 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 		 * with this clientid record.
 		 */
 		if (isFullDebug(COMPONENT_CLIENTID)) {
-			char str[HASHTABLE_DISPLAY_STRLEN];
+			char str[LOG_BUFF_LEN];
+			struct display_buffer dspbuf = {sizeof(str), str, str};
 
-			display_client_id_rec(unconf, str);
+			display_client_id_rec(&dspbuf, unconf);
 
 			LogDebug(COMPONENT_CLIENTID,
 				 "Removing unconfirmed clientid %s", str);
@@ -179,16 +191,18 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 
 		/* unhash the clientid record */
 		(void)remove_unconfirmed_client_id(unconf);
-		unconf = NULL;
 	}
 
  cleanup:
-	if (client_record) {
-		pthread_mutex_unlock(&client_record->cr_mutex);
-		dec_client_record_ref(client_record);	/* ref +0 */
-	}
+
+	PTHREAD_MUTEX_unlock(&client_record->cr_mutex);
+	dec_client_record_ref(client_record);	/* ref +0 */
+
+	if (found != NULL)
+		dec_client_id_ref(found);
 
  out:
+
 	return res_DESTROY_CLIENTID4->dcr_status;
 }
 

@@ -1,6 +1,7 @@
 /* GPFS methods for handles
  */
 
+#include <fcntl.h>
 #include "include/gpfs_nfs.h"
 
 /* private helpers from export
@@ -27,7 +28,8 @@ struct gpfs_fsal_export {
 	struct fsal_export export;
 	struct fsal_filesystem *root_fs;
 	struct glist_head filesystems;
-	bool pnfs_enabled;
+	bool pnfs_ds_enabled;
+	bool pnfs_mds_enabled;
 };
 
 /*

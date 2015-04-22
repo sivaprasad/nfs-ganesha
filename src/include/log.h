@@ -107,6 +107,7 @@ typedef enum log_components {
 	COMPONENT_9P_DISPATCH,
 	COMPONENT_FSAL_UP,
 	COMPONENT_DBUS,
+	COMPONENT_NFS_MSK,
 	COMPONENT_COUNT
 } log_components_t;
 
@@ -151,7 +152,8 @@ void DisplayLogComponentLevel(log_components_t component, char *file, int line,
 			      __attribute__ ((format(printf, 6, 7)));
 			      /* 6=format 7=params */
 
-int read_log_config(config_file_t in_config);
+int read_log_config(config_file_t in_config,
+		    struct config_error_type *err_type);
 void reread_log_config();
 
 typedef enum log_type {

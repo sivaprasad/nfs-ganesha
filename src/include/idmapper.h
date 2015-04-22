@@ -41,11 +41,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <pthread.h>
-#include "ganesha_rpc.h"
-#include "ganesha_types.h"
+#include "gsh_rpc.h"
+#include "gsh_types.h"
 
 /* Arbitrary string buffer lengths */
-#define PWENT_MAX_LEN 81
+#define PWENT_BEST_GUESS_LEN 1024
 
 /**
  * @brief Shared between idmapper.c and idmapper_cache.c.  If you

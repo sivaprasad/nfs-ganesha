@@ -37,10 +37,7 @@
 #include <sys/file.h>
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
-#include "nfs23.h"
-#include "nfs4.h"
-#include "mount.h"
+#include "fsal.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
 #include "nfs_exports.h"
@@ -49,6 +46,7 @@
 #include "nfs_proto_tools.h"
 #include "server_stats.h"
 #include "export_mgr.h"
+#include "sal_functions.h"
 
 /**
  *
@@ -57,7 +55,6 @@
  * Implements the NFSPROC3_WRITE function.
  *
  * @param[in]  arg     NFS argument union
- * @param[in]  export  NFS export list
  * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
@@ -86,11 +83,15 @@ int nfs3_write(nfs_arg_t *arg,
 	int rc = NFS_REQ_OK;
 	fsal_status_t fsal_status;
 
+	offset = arg->arg_write3.offset;
+	size = arg->arg_write3.count;
+
+	if ((arg->arg_write3.stable == DATA_SYNC) ||
+	    (arg->arg_write3.stable == FILE_SYNC))
+		sync = true;
+
 	if (isDebug(COMPONENT_NFSPROTO)) {
 		char str[LEN_FH_STR], *stables = "";
-
-		offset = arg->arg_write3.offset;
-		size = arg->arg_write3.count;
 
 		switch (arg->arg_write3.stable) {
 		case UNSTABLE:
@@ -98,11 +99,9 @@ int nfs3_write(nfs_arg_t *arg,
 			break;
 		case DATA_SYNC:
 			stables = "DATA_SYNC";
-			sync = true;
 			break;
 		case FILE_SYNC:
 			stables = "FILE_SYNC";
-			sync = true;
 			break;
 		}
 
@@ -162,7 +161,7 @@ int nfs3_write(nfs_arg_t *arg,
 	/* if quota support is active, then we should check is the
 	   FSAL allows inode creation or not */
 	fsal_status =
-	    op_ctx->fsal_export->ops->check_quota(op_ctx->fsal_export,
+	    op_ctx->fsal_export->exp_ops.check_quota(op_ctx->fsal_export,
 						   op_ctx->export->fullpath,
 						   FSAL_QUOTA_BLOCKS);
 
@@ -171,9 +170,6 @@ int nfs3_write(nfs_arg_t *arg,
 		rc = NFS_REQ_OK;
 		goto out;
 	}
-
-	offset = arg->arg_write3.offset;
-	size = arg->arg_write3.count;
 
 	if (size > arg->arg_write3.data.data_len) {
 		/* should never happen */
@@ -222,9 +218,24 @@ int nfs3_write(nfs_arg_t *arg,
 		written_size = 0;
 	} else {
 		/* An actual write is to be made, prepare it */
+
+		res->res_write3.status = nfs3_Errno_state(
+				state_share_anonymous_io_start(
+					entry,
+					OPEN4_SHARE_ACCESS_WRITE,
+					SHARE_BYPASS_V3_WRITE));
+
+		if (res->res_write3.status != NFS3_OK) {
+			rc = NFS_REQ_OK;
+			goto out;
+		}
+
 		cache_status =
 		    cache_inode_rdwr(entry, CACHE_INODE_WRITE, offset, size,
 				     &written_size, data, &eof_met, &sync);
+
+		state_share_anonymous_io_done(entry, OPEN4_SHARE_ACCESS_WRITE);
+
 		if (cache_status == CACHE_INODE_SUCCESS) {
 			/* Build Weak Cache Coherency data */
 			nfs_SetWccData(NULL, entry,

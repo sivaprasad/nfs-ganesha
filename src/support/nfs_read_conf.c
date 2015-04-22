@@ -41,7 +41,7 @@
 #include <netdb.h>
 #include <ctype.h>
 #include "log.h"
-#include "ganesha_rpc.h"
+#include "gsh_rpc.h"
 #include "fsal.h"
 #include "nfs23.h"
 #include "nfs4.h"
@@ -60,7 +60,14 @@
 
 static struct config_item_list protocols[] = {
 	CONFIG_LIST_TOK("3", CORE_OPTION_NFSV3),
+	CONFIG_LIST_TOK("v3", CORE_OPTION_NFSV3),
+	CONFIG_LIST_TOK("nfs3", CORE_OPTION_NFSV3),
+	CONFIG_LIST_TOK("nfsv3", CORE_OPTION_NFSV3),
 	CONFIG_LIST_TOK("4", CORE_OPTION_NFSV4),
+	CONFIG_LIST_TOK("v4", CORE_OPTION_NFSV4),
+	CONFIG_LIST_TOK("nfs4", CORE_OPTION_NFSV4),
+	CONFIG_LIST_TOK("nfsv4", CORE_OPTION_NFSV4),
+	CONFIG_LIST_TOK("9p", CORE_OPTION_9P),
 	CONFIG_LIST_EOL
 };
 
@@ -73,8 +80,8 @@ static struct config_item core_params[] = {
 		       nfs_core_param, port[P_NLM]),
 	CONF_ITEM_UI16("Rquota_Port", 0, UINT16_MAX, RQUOTA_PORT,
 		       nfs_core_param, port[P_RQUOTA]),
-	CONF_ITEM_IPV4_ADDR("Bind_Addr", "0.0.0.0",
-			    nfs_core_param, bind_addr),
+	CONF_ITEM_IP_ADDR("Bind_Addr", "0.0.0.0",
+			  nfs_core_param, bind_addr),
 	CONF_ITEM_UI32("NFS_Program", 1, INT32_MAX, NFS_PROGRAM,
 		       nfs_core_param, program[P_NFS]),
 	CONF_ITEM_UI32("MNT_Program", 1, INT32_MAX, MOUNTPROG,
@@ -141,6 +148,8 @@ static struct config_item core_params[] = {
 		      nfs_core_param, decoder_fridge_block_timeout),
 	CONF_ITEM_LIST("NFS_Protocols", CORE_OPTION_ALL_VERS, protocols,
 		       nfs_core_param, core_options),
+	CONF_ITEM_LIST("Protocols", CORE_OPTION_ALL_VERS, protocols,
+		       nfs_core_param, core_options),
 	CONF_ITEM_BOOL("NSM_Use_Caller_Name", false,
 		       nfs_core_param, nsm_use_caller_name),
 	CONF_ITEM_BOOL("Clustered", true,
@@ -155,6 +164,8 @@ static struct config_item core_params[] = {
 			nfs_core_param, manage_gids_expiration),
 	CONF_ITEM_PATH("Plugins_Dir", 1, MAXPATHLEN, FSAL_MODULE_LOC,
 		       nfs_core_param, ganesha_modules_loc),
+	CONF_ITEM_UI32("heartbeat_freq", 0, 5000, 1000,
+		       nfs_core_param, heartbeat_freq),
 	CONFIG_EOL
 };
 
@@ -207,8 +218,6 @@ struct config_block krb5_param = {
  */
 
 static struct config_item version4_params[] = {
-	CONF_ITEM_BOOL("FSAL_Grace", false,
-		       nfs_version4_parameter, fsal_grace),
 	CONF_ITEM_BOOL("Graceless", false,
 		       nfs_version4_parameter, graceless),
 	CONF_ITEM_UI32("Lease_Lifetime", 0, 120, LEASE_LIFETIME_DEFAULT,
@@ -225,6 +234,13 @@ static struct config_item version4_params[] = {
 		       nfs_version4_parameter, allow_numeric_owners),
 	CONF_ITEM_BOOL("Delegations", false,
 		       nfs_version4_parameter, allow_delegations),
+	CONF_ITEM_UI32("Deleg_Recall_Retry_Delay", 0, 10,
+			DELEG_RECALL_RETRY_DELAY_DEFAULT,
+			nfs_version4_parameter, deleg_recall_retry_delay),
+	CONF_ITEM_BOOL("PNFS_MDS", true,
+		       nfs_version4_parameter, pnfs_mds),
+	CONF_ITEM_BOOL("PNFS_DS", true,
+		       nfs_version4_parameter, pnfs_ds),
 	CONFIG_EOL
 };
 

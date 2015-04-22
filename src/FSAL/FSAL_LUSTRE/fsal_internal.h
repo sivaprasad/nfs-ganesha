@@ -40,25 +40,19 @@
 #include <sys/stat.h>
 #include "fsal_pnfs.h"
 #include "lustre_extended_types.h"
+#include "lustre_methods.h"
+#include "fsal_handle.h"
+#ifdef USE_FSAL_LUSTRE_UP
+#include "lcap_client.h"
+#endif
+
+extern const char myname[];
+extern bool is_fsal_shook;
 
 #define min(a, b)          \
 	({ typeof(a) _a = (a);     \
 	typeof(b) _b = (b);        \
 	_a < _b ? _a : _b; })
-
-/* this needs to be refactored to put ipport inside sockaddr_in */
-struct lustre_pnfs_ds_parameter {
-	struct glist_head ds_list;
-	struct sockaddr_storage ipaddr; /* sockaddr_storage would be better */
-	unsigned short ipport;
-	unsigned int id;
-};
-
-struct lustre_pnfs_parameter {
-	unsigned int stripe_size; /* unused */
-	unsigned int stripe_width;
-	struct glist_head ds_list;
-};
 
 /* defined the set of attributes supported with POSIX */
 #define LUSTRE_SUPPORTED_ATTRIBUTES (                                       \
@@ -106,20 +100,21 @@ void set_credentials(struct user_cred *creds);
 void set_creds_to_root();
 
 struct lustre_ds {
-	struct lustre_file_handle wire; /*< Wire data */
 	struct fsal_ds_handle ds; /*< Public DS handle */
+	struct lustre_file_handle wire; /*< Wire data */
 	struct lustre_filesystem *lustre_fs; /*< Related Lustre filesystem */
 	bool connected; /*< True if the handle has been connected */
 };
 
 void lustre_handle_ops_init(struct fsal_obj_ops *ops);
-extern bool pnfs_enabled;
+
+/* Upcalls thread for FSAL_LUSTRE */
+void *LUSTREFSAL_UP_Thread(void *Arg);
 
 /* Add missing prototype in vfs.h */
 int fd_to_handle(int fd, void **hanp, size_t *hlen);
 void lustre_export_ops_init(struct export_ops *ops);
 void lustre_handle_ops_init(struct fsal_obj_ops *ops);
-extern struct lustre_pnfs_parameter pnfs_param;
 
 /* LUSTRE methods for pnfs
  */
@@ -130,5 +125,8 @@ nfsstat4 lustre_getdeviceinfo(struct fsal_module *fsal_hdl,
 			      const struct pnfs_deviceid *deviceid);
 
 size_t lustre_fs_da_addr_size(struct fsal_module *fsal_hdl);
+void export_ops_pnfs(struct export_ops *ops);
+void handle_ops_pnfs(struct fsal_obj_ops *ops);
+void lustre_pnfs_ds_ops_init(struct fsal_pnfs_ds_ops *ops);
 
-#endif
+#endif /* _LUSTRE_FSAL_INTERNAL_H */

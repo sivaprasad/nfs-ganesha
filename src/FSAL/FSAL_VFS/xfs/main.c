@@ -31,12 +31,12 @@
 
 #include "config.h"
 
-#include "fsal.h"
 #include <libgen.h>		/* used for 'dirname' */
 #include <pthread.h>
 #include <string.h>
 #include <limits.h>
 #include <sys/types.h>
+#include "fsal.h"
 #include "FSAL/fsal_init.h"
 
 /* VFS FSAL module private storage
@@ -80,6 +80,7 @@ static struct fsal_staticfsinfo_t default_posix_info = {
 	.supported_attrs = XFS_SUPPORTED_ATTRIBUTES,
 	.maxread = FSAL_MAXIOSIZE,
 	.maxwrite = FSAL_MAXIOSIZE,
+	.link_supports_permission_checks = false,
 };
 
 static struct config_item xfs_params[] = {
@@ -93,11 +94,11 @@ static struct config_item xfs_params[] = {
 		       fsal_staticfsinfo_t, maxread),
 	CONF_ITEM_UI64("maxwrite", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,
 		       fsal_staticfsinfo_t, maxwrite),
-	CONF_ITEM_MODE("umask", 0, 0777, 0,
+	CONF_ITEM_MODE("umask", 0,
 		       fsal_staticfsinfo_t, umask),
 	CONF_ITEM_BOOL("auth_xdev_export", false,
 		       fsal_staticfsinfo_t, auth_exportpath_xdev),
-	CONF_ITEM_MODE("xattr_access_rights", 0, 0777, 0400,
+	CONF_ITEM_MODE("xattr_access_rights", 0400,
 		       fsal_staticfsinfo_t, xattr_access_rights),
 	CONFIG_EOL
 };
@@ -130,19 +131,19 @@ struct fsal_staticfsinfo_t *vfs_staticinfo(struct fsal_module *hdl)
  */
 
 static fsal_status_t init_config(struct fsal_module *fsal_hdl,
-				 config_file_t config_struct)
+				 config_file_t config_struct,
+				 struct config_error_type *err_type)
 {
 	struct xfs_fsal_module *xfs_me =
 	    container_of(fsal_hdl, struct xfs_fsal_module, fsal);
-	struct config_error_type err_type;
 
 	xfs_me->fs_info = default_posix_info;	/* copy the consts */
 	(void) load_config_from_parse(config_struct,
 				      &xfs_param,
 				      &xfs_me->fs_info,
 				      true,
-				      &err_type);
-	if (!config_error_is_harmless(&err_type))
+				      err_type);
+	if (!config_error_is_harmless(err_type))
 		return fsalstat(ERR_FSAL_INVAL, 0);
 	display_fsinfo(&xfs_me->fs_info);
 	LogFullDebug(COMPONENT_FSAL,
@@ -162,6 +163,7 @@ static fsal_status_t init_config(struct fsal_module *fsal_hdl,
 
 fsal_status_t vfs_create_export(struct fsal_module *fsal_hdl,
 				void *parse_node,
+				struct config_error_type *err_type,
 				const struct fsal_up_vector *up_ops);
 
 /* Module initialization.
@@ -188,8 +190,8 @@ MODULE_INIT void xfs_init(void)
 		fprintf(stderr, "XFS module failed to register");
 		return;
 	}
-	myself->ops->create_export = vfs_create_export;
-	myself->ops->init_config = init_config;
+	myself->m_ops.create_export = vfs_create_export;
+	myself->m_ops.init_config = init_config;
 }
 
 MODULE_FINI void xfs_unload(void)

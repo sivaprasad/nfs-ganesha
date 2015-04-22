@@ -36,10 +36,7 @@
 #include <sys/file.h>		/* for having FNDELAY */
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
-#include "nfs23.h"
-#include "nfs4.h"
-#include "mount.h"
+#include "fsal.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
 #include "nfs_exports.h"
@@ -57,7 +54,6 @@
  * Implements the NFSPROC3_MKDIR.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  export  NFS export list
  * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
@@ -121,7 +117,7 @@ int nfs3_mkdir(nfs_arg_t *arg,
 	/* if quota support is active, then we should check is the
 	   FSAL allows inode creation or not */
 	fsal_status =
-	    op_ctx->fsal_export->ops->check_quota(op_ctx->fsal_export,
+	    op_ctx->fsal_export->exp_ops.check_quota(op_ctx->fsal_export,
 						   op_ctx->export->fullpath,
 						   FSAL_QUOTA_INODES);
 

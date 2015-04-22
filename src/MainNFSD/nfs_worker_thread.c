@@ -45,11 +45,7 @@
 #include "hashtable.h"
 #include "abstract_atomic.h"
 #include "log.h"
-#include "ganesha_rpc.h"
-#include "nfs23.h"
-#include "nfs4.h"
-#include "mount.h"
-#include "nlm4.h"
+#include "fsal.h"
 #include "rquota.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
@@ -64,6 +60,10 @@
 #include "export_mgr.h"
 #include "server_stats.h"
 #include "uid2grp.h"
+
+#ifdef USE_LTTNG
+#include "gsh_lttng/nfs_rpc.h"
+#endif
 
 pool_t *request_pool;
 pool_t *request_data_pool;
@@ -714,13 +714,17 @@ static void nfs_rpc_execute(request_data_t *req,
 	int protocol_options = 0;
 	struct user_cred user_credentials;
 	struct req_op_context req_ctx;
-	const char * client_ip = "<unknown client>";
+	const char *client_ip = "<unknown client>";
 	dupreq_status_t dpq_status;
 	struct timespec timer_start;
 	int port, rc = NFS_REQ_OK;
 	enum auth_stat auth_rc;
 	bool slocked = false;
 	const char *progname = "unknown";
+
+#ifdef USE_LTTNG
+	tracepoint(nfs_rpc, start, req);
+#endif
 
 	/* Initialize permissions to allow nothing */
 	export_perms.options = 0;
@@ -1219,7 +1223,7 @@ static void nfs_rpc_execute(request_data_t *req,
 				export_perms.options = EXPORT_OPTION_ROOT;
 			}
 
-			if (get_req_creds(svcreq) == false) {
+			if (nfs_req_creds(svcreq) != NFS4_OK) {
 				LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 					"could not get uid and gid, rejecting client %s",
 					client_ip);
@@ -1254,9 +1258,21 @@ static void nfs_rpc_execute(request_data_t *req,
 #endif
 
  null_op:
+
+#ifdef USE_LTTNG
+		tracepoint(nfs_rpc, op_start, req,
+			   reqnfs->funcdesc->funcname,
+			   (op_ctx->export != NULL
+			    ? op_ctx->export->export_id : -1));
+#endif
 		rc = reqnfs->funcdesc->service_function(arg_nfs,
 							worker_data, svcreq,
 							res_nfs);
+
+#ifdef USE_LTTNG
+		tracepoint(nfs_rpc, op_end, req);
+#endif
+
 	}
 
  req_error:
@@ -1372,6 +1388,11 @@ out:
 	if (op_ctx->export != NULL)
 		put_gsh_export(op_ctx->export);
 	op_ctx = NULL;
+
+#ifdef USE_LTTNG
+	tracepoint(nfs_rpc, end, req);
+#endif
+
 	return;
 }
 
@@ -1385,6 +1406,14 @@ out:
 static void _9p_execute(request_data_t *req, nfs_worker_data_t *worker_data)
 {
 	struct _9p_request_data *req9p = &req->r_u._9p;
+	struct req_op_context req_ctx;
+	struct export_perms export_perms;
+
+	memset(&req_ctx, 0, sizeof(struct req_op_context));
+	op_ctx = &req_ctx;
+	op_ctx->caller_addr = &worker_data->hostaddr;
+	op_ctx->req_type = req->rtype;
+	op_ctx->export_perms = &export_perms;
 
 	if (req9p->pconn->trans_type == _9P_TCP)
 		_9p_tcp_process_request(req9p, worker_data);
@@ -1490,15 +1519,15 @@ static void worker_run(struct fridgethr_context *ctx)
 			/* check for destroyed xprts */
 			xu = (gsh_xprt_private_t *) nfsreq->r_u.nfs->xprt->
 			    xp_u1;
-			pthread_mutex_lock(&nfsreq->r_u.nfs->xprt->xp_lock);
+			PTHREAD_MUTEX_lock(&nfsreq->r_u.nfs->xprt->xp_lock);
 			if (nfsreq->r_u.nfs->xprt->
 			    xp_flags & SVC_XPRT_FLAG_DESTROYED) {
-				pthread_mutex_unlock(&nfsreq->r_u.nfs->xprt->
+				PTHREAD_MUTEX_unlock(&nfsreq->r_u.nfs->xprt->
 						     xp_lock);
 				goto finalize_req;
 			}
 			reqcnt = xu->req_cnt;
-			pthread_mutex_unlock(&nfsreq->r_u.nfs->xprt->xp_lock);
+			PTHREAD_MUTEX_unlock(&nfsreq->r_u.nfs->xprt->xp_lock);
 			/* execute */
 			LogDebug(COMPONENT_DISPATCH,
 				 "NFS protocol request, nfsreq=%p xprt=%p req_cnt=%d",

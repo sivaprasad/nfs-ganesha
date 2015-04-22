@@ -86,10 +86,14 @@ bool fsal_supports(struct fsal_staticfsinfo_t *info,
 		return !!info->homogenous;
 	case fso_auth_exportpath_xdev:
 		return !!info->auth_exportpath_xdev;
-	case fso_delegations:
-		return !!info->delegations;
+	case fso_delegations_r:
+		return !!(info->delegations & FSAL_OPTION_FILE_READ_DELEG);
+	case fso_delegations_w:
+		return !!(info->delegations & FSAL_OPTION_FILE_WRITE_DELEG);
+	case fso_pnfs_mds_supported:
+		return !!info->pnfs_mds;
 	case fso_pnfs_ds_supported:
-		return !!info->pnfs_file;
+		return !!info->pnfs_ds;
 	case fso_accesscheck_support:
 		return !!info->accesscheck_support;
 	case fso_share_support:
@@ -98,6 +102,10 @@ bool fsal_supports(struct fsal_staticfsinfo_t *info,
 		return !!info->share_support_owner;
 	case fso_reopen_method:
 		return !!info->reopen_method;
+	case fso_grace_method:
+		return !!info->fsal_grace;
+	case fso_link_supports_permission_checks:
+		return !!info->link_supports_permission_checks;
 	default:
 		return false;	/* whatever I don't know about,
 				 * you can't do

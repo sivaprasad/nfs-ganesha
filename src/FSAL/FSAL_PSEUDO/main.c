@@ -1,6 +1,4 @@
 /*
- * vim:expandtab:shiftwidth=8:tabstop=8:
- *
  * Copyright (C) Panasas Inc., 2011
  * Author: Jim Lieb jlieb@panasas.com
  *
@@ -88,6 +86,7 @@ static struct fsal_staticfsinfo_t default_posix_info = {
 	.umask = 0,
 	.auth_exportpath_xdev = false,
 	.xattr_access_rights = 0400,	/* root=RW, owner=R */
+	.link_supports_permission_checks = false,
 };
 
 /* private helper for export object
@@ -101,15 +100,8 @@ struct fsal_staticfsinfo_t *pseudofs_staticinfo(struct fsal_module *hdl)
 	return &myself->fs_info;
 }
 
-/* Module methods
- */
-
-/* init_config
- * must be called with a reference taken (via lookup_fsal)
- */
-
-static fsal_status_t init_config(struct fsal_module *fsal_hdl,
-				 config_file_t config_struct)
+/* Initialize pseudo fs info */
+static void init_config(struct fsal_module *fsal_hdl)
 {
 	struct pseudo_fsal_module *pseudofs_me =
 	    container_of(fsal_hdl, struct pseudo_fsal_module, fsal);
@@ -132,7 +124,6 @@ static fsal_status_t init_config(struct fsal_module *fsal_hdl,
 	LogDebug(COMPONENT_FSAL,
 		 "FSAL INIT: Supported attributes mask = 0x%" PRIx64,
 		 pseudofs_me->fs_info.supported_attrs);
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /* Module initialization.
@@ -170,8 +161,10 @@ void pseudo_fsal_init(void)
 		fprintf(stderr, "PSEUDO module failed to register");
 		return;
 	}
-	myself->ops->create_export = pseudofs_create_export;
-	myself->ops->init_config = init_config;
-	myself->ops->unload = unload_pseudo_fsal;
+	myself->m_ops.create_export = pseudofs_create_export;
+	myself->m_ops.unload = unload_pseudo_fsal;
 	myself->name = gsh_strdup("PSEUDO");
+
+	/* initialize our config */
+	init_config(myself);
 }

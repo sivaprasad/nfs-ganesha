@@ -127,7 +127,7 @@ static size_t fs_loc_body_size(struct fsal_export *export_pub)
  */
 size_t fs_da_addr_size(struct fsal_module *fsal_hdl)
 {
-	return 0x1400;
+	return 0x20000;
 }
 
 /**
@@ -148,14 +148,14 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 		       XDR *da_addr_body, const layouttype4 type,
 		       const struct pnfs_deviceid *deviceid)
 {
-	/* The position before any bytes are sent to the stream */
-	size_t da_beginning = 0;
-	/* The total length of the XDR-encoded da_addr_body */
-	size_t da_length = 0;
-	int rc = 0;
-	size_t ds_buffer = 0;
 	struct deviceinfo_arg darg;
-	int errsv = 0;
+	/* The position before any bytes are sent to the stream */
+	size_t da_beginning;
+	size_t ds_buffer;
+	/* The total length of the XDR-encoded da_addr_body */
+	size_t da_length;
+	int rc;
+	int errsv;
 
 	darg.mountdirfd = deviceid->device_id4;
 	darg.type = LAYOUT4_NFSV4_1_FILES;
@@ -165,15 +165,15 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 	darg.devid.device_id4 = deviceid->device_id4;
 	darg.devid.devid = deviceid->devid;
 
-	ds_buffer = fs_da_addr_size(NULL);
-
-	darg.xdr.p = (int *)da_addr_body->x_base;
 	da_beginning = xdr_getpos(da_addr_body);
-	darg.xdr.end = (int *)(darg.xdr.p + (ds_buffer - da_beginning));
+	darg.xdr.p = xdr_inline(da_addr_body, 0);
+	ds_buffer = da_addr_body->x_handy; /* xdr_size_inline(da_addr_body); */
+	darg.xdr.end = (int *)(darg.xdr.p
+			+ ((ds_buffer - da_beginning) / BYTES_PER_XDR_UNIT));
 
 	LogDebug(COMPONENT_PNFS,
-		"getdeviceinfo p %p end %p da_length %ld seq %d fd %d fsid 0x%lx\n",
-		darg.xdr.p, darg.xdr.end, da_beginning,
+		"getdeviceinfo p %p end %p da_length %lu ds_buffer %lu seq %d fd %d fsid 0x%lx\n",
+		darg.xdr.p, darg.xdr.end, da_beginning, ds_buffer,
 		deviceid->device_id2, deviceid->device_id4,
 		deviceid->devid);
 
@@ -186,7 +186,7 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 			LogFatal(COMPONENT_PNFS, "GPFS Returned EUNATCH");
 		return NFS4ERR_RESOURCE;
 	}
-	xdr_setpos(da_addr_body, rc);
+	(void)xdr_inline(da_addr_body, rc);
 	da_length = xdr_getpos(da_addr_body) - da_beginning;
 
 	LogDebug(COMPONENT_PNFS, "getdeviceinfo rc %d da_length %ld\n", rc,
@@ -336,20 +336,29 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_hdl,
 	deviceid.devid = file_layout.device_id.devid;
 	/* last_possible_byte = NFS4_UINT64_MAX; strict. set but unused */
 
-	LogDebug(COMPONENT_PNFS, "fsal_id %d seq %d fd %d fsid 0x%lx",
+	LogDebug(COMPONENT_PNFS, "fsal_id %d seq %d fd %d fsid 0x%lx index %d",
 		deviceid.fsal_id, deviceid.device_id2,
-		deviceid.device_id4, deviceid.devid);
+		deviceid.device_id4, deviceid.devid,
+		file_layout.lg_first_stripe_index);
 
 	ds_desc.addr = &gpfs_ds_handle;
 	ds_desc.len = sizeof(struct gpfs_file_handle);
 
 	nfs_status =
-	     FSAL_encode_file_layout(loc_body, &deviceid, util, 0, 0,
+	     FSAL_encode_file_layout(loc_body, &deviceid, util,
+				     file_layout.lg_first_stripe_index, 0,
 				     req_ctx->export->export_id, 1,
 				     &ds_desc);
 	if (nfs_status) {
-		LogCrit(COMPONENT_PNFS,
-			"Failed to encode nfsv4_1_file_layout.");
+		if (arg->maxcount <=
+		    op_ctx->fsal_export->
+		    exp_ops.fs_loc_body_size(op_ctx->fsal_export)) {
+			nfs_status = NFS4ERR_TOOSMALL;
+			LogDebug(COMPONENT_PNFS,
+				"Failed to encode nfsv4_1_file_layout.");
+		} else
+			LogCrit(COMPONENT_PNFS,
+				"Failed to encode nfsv4_1_file_layout.");
 		goto relinquish;
 	}
 

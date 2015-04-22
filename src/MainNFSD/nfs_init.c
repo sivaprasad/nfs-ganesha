@@ -29,27 +29,23 @@
  * @brief Most of the init routines
  */
 #include "config.h"
-#include "ganesha_rpc.h"
 #include "nfs_init.h"
 #include "log.h"
 #include "fsal.h"
-#include "nfs23.h"
-#include "nfs4.h"
-#include "mount.h"
-#include "nlm4.h"
 #include "rquota.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
 #include "cache_inode_lru.h"
 #include "nfs_file_handle.h"
 #include "nfs_exports.h"
+#include "nfs_ip_stats.h"
 #include "nfs_proto_functions.h"
 #include "nfs_dupreq.h"
 #include "config_parsing.h"
 #include "nfs4_acls.h"
 #include "nfs_rpc_callback.h"
 #ifdef USE_DBUS
-#include "ganesha_dbus.h"
+#include "gsh_dbus.h"
 #endif
 #ifdef _USE_CB_SIMULATOR
 #include "nfs_rpc_callback_simulator.h"
@@ -72,6 +68,7 @@
 #include <sys/capability.h>	/* For capget/capset */
 #endif
 #include "uid2grp.h"
+#include "pnfs_utils.h"
 
 
 /* global information exported to all layers (as extern vars) */
@@ -85,7 +82,7 @@ verifier4 NFS4_write_verifier;	/* NFS V4 write verifier */
 writeverf3 NFS3_write_verifier;	/* NFS V3 write verifier */
 
 /* node ID used to identify an individual node in a cluster */
-ushort g_nodeid = 0;
+int g_nodeid = 0;
 
 nfs_start_info_t nfs_start_info;
 
@@ -101,9 +98,13 @@ pthread_t _9p_dispatcher_thrid;
 pthread_t _9p_rdma_dispatcher_thrid;
 #endif
 
-char *config_path = "/etc/ganesha/ganesha.conf";
+#ifdef _USE_NFS_MSK
+pthread_t nfs_msk_dispatcher_thrid;
+#endif
 
-char *pidfile_path = "/var/run/ganesha.pid";
+char *config_path = GANESHA_CONFIG_PATH;
+
+char *pidfile_path = GANESHA_PIDFILE_PATH;
 
 /**
  * @brief This thread is in charge of signal management
@@ -224,28 +225,29 @@ void nfs_print_param_config()
  *
  * @param[in]  config_struct Parsed config file
  * @param[out] p_start_info  Startup parameters
+ * @param[out] err_type error reporting state
  *
  * @return -1 on failure.
  */
 int nfs_set_param_from_conf(config_file_t parse_tree,
-			    nfs_start_info_t *p_start_info)
+			    nfs_start_info_t *p_start_info,
+			    struct config_error_type *err_type)
 {
-	struct config_error_type err_type;
-
 	/*
 	 * Initialize exports and clients so config parsing can use them
 	 * early.
 	 */
 	client_pkginit();
 	export_pkginit();
+	server_pkginit();
 
 	/* Core parameters */
 	(void) load_config_from_parse(parse_tree,
-				    &nfs_core,
-				    &nfs_param.core_param,
-				    true,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type)) {
+				      &nfs_core,
+				      &nfs_param.core_param,
+				      true,
+				      err_type);
+	if (!config_error_is_harmless(err_type)) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing core configuration");
 		return -1;
@@ -253,11 +255,11 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 
 	/* Worker paramters: ip/name hash table and expiration for each entry */
 	(void) load_config_from_parse(parse_tree,
-				    &nfs_ip_name,
-				    NULL,
-				    true,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type)) {
+				      &nfs_ip_name,
+				      NULL,
+				      true,
+				      err_type);
+	if (!config_error_is_harmless(err_type)) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing IP/name configuration");
 		return -1;
@@ -266,11 +268,11 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 #ifdef _HAVE_GSSAPI
 	/* NFS kerberos5 configuration */
 	(void) load_config_from_parse(parse_tree,
-				    &krb5_param,
-				    &nfs_param.krb5_param,
-				    true,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type)) {
+				      &krb5_param,
+				      &nfs_param.krb5_param,
+				      true,
+				      err_type);
+	if (!config_error_is_harmless(err_type)) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing NFS/KRB5 configuration for RPCSEC_GSS");
 		return -1;
@@ -279,11 +281,11 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 
 	/* NFSv4 specific configuration */
 	(void) load_config_from_parse(parse_tree,
-				    &version4_param,
-				    &nfs_param.nfsv4_param,
-				    true,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type)) {
+				      &version4_param,
+				      &nfs_param.nfsv4_param,
+				      true,
+				      err_type);
+	if (!config_error_is_harmless(err_type)) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing NFSv4 specific configuration");
 		return -1;
@@ -294,8 +296,8 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 				      &_9p_param_blk,
 				      NULL,
 				      true,
-				      &err_type);
-	if (!config_error_is_harmless(&err_type)) {
+				      err_type);
+	if (!config_error_is_harmless(err_type)) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing 9P specific configuration");
 		return -1;
@@ -304,11 +306,11 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 
 	/* Cache inode client parameters */
 	(void) load_config_from_parse(parse_tree,
-				    &cache_inode_param_blk,
-				    NULL,
-				    true,
-				    &err_type);
-	if (!config_error_is_harmless(&err_type)) {
+				      &cache_inode_param_blk,
+				      NULL,
+				      true,
+				      err_type);
+	if (!config_error_is_harmless(err_type)) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing 9P specific configuration");
 		return -1;
@@ -404,28 +406,48 @@ static void nfs_Start_threads(void)
 
 #ifdef _USE_9P
 	/* Starting the 9P/TCP dispatcher thread */
-	rc = pthread_create(&_9p_dispatcher_thrid, &attr_thr,
-			    _9p_dispatcher_thread, NULL);
-	if (rc != 0) {
-		LogFatal(COMPONENT_THREAD,
-			 "Could not create  9P/TCP dispatcher, error = %d (%s)",
-			 errno, strerror(errno));
+	if (nfs_param.core_param.core_options & CORE_OPTION_9P) {
+		rc = pthread_create(&_9p_dispatcher_thrid, &attr_thr,
+				    _9p_dispatcher_thread, NULL);
+		if (rc != 0) {
+			LogFatal(COMPONENT_THREAD,
+				 "Could not create  9P/TCP dispatcher,"
+				 " error = %d (%s)",
+				 errno, strerror(errno));
+		}
+		LogEvent(COMPONENT_THREAD,
+			 "9P/TCP dispatcher thread was started successfully");
 	}
-	LogEvent(COMPONENT_THREAD,
-		 "9P/TCP dispatcher thread was started successfully");
 #endif
 
 #ifdef _USE_9P_RDMA
 	/* Starting the 9P/RDMA dispatcher thread */
-	rc = pthread_create(&_9p_rdma_dispatcher_thrid, &attr_thr,
-			    _9p_rdma_dispatcher_thread, NULL);
+	if (nfs_param.core_param.core_options & CORE_OPTION_9P) {
+		rc = pthread_create(&_9p_rdma_dispatcher_thrid, &attr_thr,
+				    _9p_rdma_dispatcher_thread, NULL);
+		if (rc != 0) {
+			LogFatal(COMPONENT_THREAD,
+				 "Could not create  9P/RDMA dispatcher,"
+				 " error = %d (%s)",
+				 errno, strerror(errno));
+		}
+		LogEvent(COMPONENT_THREAD,
+			 "9P/RDMA dispatcher thread was started successfully");
+	}
+#endif
+
+#ifdef _USE_NFS_MSK
+	/* Starting the NFS/MSK dispatcher thread */
+	rc = pthread_create(&nfs_msk_dispatcher_thrid, &attr_thr,
+			    nfs_msk_dispatcher_thread, NULL);
+
 	if (rc != 0) {
 		LogFatal(COMPONENT_THREAD,
-			 "Could not create  9P/RDMA dispatcher, error = %d (%s)",
+			 "Could not create NFS/MSK dispatcher, error = %d (%s)",
 			 errno, strerror(errno));
 	}
 	LogEvent(COMPONENT_THREAD,
-		 "9P/RDMA dispatcher thread was started successfully");
+		 "NFS/MSK dispatcher thread was started successfully");
 #endif
 
 #ifdef USE_DBUS
@@ -697,8 +719,7 @@ static void nfs_Init(const nfs_start_info_t *p_start_info)
 	 */
 	nfs4_create_recov_dir();
 
-	/* initialize grace and read in the client IDs */
-	nfs4_init_grace();
+	/* read in the client IDs */
 	nfs4_load_recov_clids(NULL);
 
 	/* Start grace period */

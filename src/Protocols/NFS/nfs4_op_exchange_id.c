@@ -32,7 +32,7 @@
 #include "config.h"
 #include <pthread.h>
 #include "log.h"
-#include "nfs4.h"
+#include "fsal.h"
 #include "nfs_core.h"
 #include "nfs_proto_functions.h"
 #include "sal_functions.h"
@@ -85,7 +85,6 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 	nfs_client_record_t *client_record;
 	nfs_client_id_t *conf;
 	nfs_client_id_t *unconf;
-	sockaddr_t client_addr;
 	int rc;
 	int len;
 	char *temp;
@@ -115,18 +114,32 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 			   EXCHGID4_FLAG_CONFIRMED_R)) != 0)
 		return res_EXCHANGE_ID4->eir_status = NFS4ERR_INVAL;
 
-	copy_xprt_addr(&client_addr, data->req->rq_xprt);
-
-	/**
-	 * @todo Look into this again later, if no exports support
-	 * pNFS, then we shouldn't claim to support it.
-	 */
-
+	/* If client did not ask for pNFS related server roles than just set
+	   server roles */
 	pnfs_flags = arg_EXCHANGE_ID4->eia_flags & EXCHGID4_FLAG_MASK_PNFS;
 	if (pnfs_flags == 0) {
-		pnfs_flags |=
-		    EXCHGID4_FLAG_USE_PNFS_MDS | EXCHGID4_FLAG_USE_PNFS_DS;
+		if (nfs_param.nfsv4_param.pnfs_mds)
+			pnfs_flags |= EXCHGID4_FLAG_USE_PNFS_MDS;
+		if (nfs_param.nfsv4_param.pnfs_ds)
+			pnfs_flags |= EXCHGID4_FLAG_USE_PNFS_DS;
+		if (pnfs_flags == 0)
+			pnfs_flags |= EXCHGID4_FLAG_USE_NON_PNFS;
 	}
+	/* If client did ask for pNFS related server roles than try to match the
+	   server roles to the client request. */
+	else {
+		if ((arg_EXCHANGE_ID4->eia_flags & EXCHGID4_FLAG_USE_PNFS_MDS)
+		    && (nfs_param.nfsv4_param.pnfs_mds))
+			pnfs_flags |= EXCHGID4_FLAG_USE_PNFS_MDS;
+		if ((arg_EXCHANGE_ID4->eia_flags & EXCHGID4_FLAG_USE_PNFS_DS)
+		    && (nfs_param.nfsv4_param.pnfs_ds))
+			pnfs_flags |= EXCHGID4_FLAG_USE_PNFS_DS;
+		if (pnfs_flags == 0)
+			pnfs_flags |= EXCHGID4_FLAG_USE_NON_PNFS;
+	}
+	LogDebug(COMPONENT_CLIENTID,
+		"EXCHANGE_ID pnfs_flags 0x%08x eia_flags 0x%08x",
+		 pnfs_flags, arg_EXCHANGE_ID4->eia_flags);
 
 	update = (arg_EXCHANGE_ID4->eia_flags &
 		  EXCHGID4_FLAG_UPD_CONFIRMED_REC_A) != 0;
@@ -156,7 +169,7 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 	 * 18.35.4. IMPLEMENTATION
 	 */
 
-	pthread_mutex_lock(&client_record->cr_mutex);
+	PTHREAD_MUTEX_lock(&client_record->cr_mutex);
 
 	conf = client_record->cr_confirmed_rec;
 
@@ -175,20 +188,20 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 		 */
 		if (!nfs_compare_clientcred(&conf->cid_credential,
 					    &data->credential)) {
-			pthread_mutex_lock(&conf->cid_mutex);
+			PTHREAD_MUTEX_lock(&conf->cid_mutex);
 			if (!valid_lease(conf) || !client_id_has_state(conf)) {
-				pthread_mutex_unlock(&conf->cid_mutex);
+				PTHREAD_MUTEX_unlock(&conf->cid_mutex);
 
 				/* CASE 3, client collisions, old
 				 * clientid is expired
 				 *
 				 * Expire clientid and release our reference.
 				 */
-				nfs_client_id_expire(conf);
+				nfs_client_id_expire(conf, false);
 				dec_client_id_ref(conf);
 				conf = NULL;
 			} else {
-				pthread_mutex_unlock(&conf->cid_mutex);
+				PTHREAD_MUTEX_unlock(&conf->cid_mutex);
 				/* CASE 3, client collisions, old
 				 * clientid is not expired
 				 */
@@ -226,9 +239,9 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 			   NFS4_VERIFIER_SIZE) == 0) {
 			if (!nfs_compare_clientcred(&conf->cid_credential,
 						    &data->credential)
-			    || !cmp_sockaddr(&conf->cid_client_addr,
-					     &client_addr,
-					     true)) {
+			    || op_ctx->client == NULL
+			    || conf->gsh_client == NULL
+			    || op_ctx->client != conf->gsh_client) {
 				/* CASE 9, Update but wrong principal */
 				res_EXCHANGE_ID4->eir_status = NFS4ERR_PERM;
 			} else {
@@ -276,7 +289,6 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 
 	unconf = create_client_id(0,
 				  client_record,
-				  &client_addr,
 				  &data->credential,
 				  data->minorversion);
 
@@ -326,6 +338,7 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 	    unconf->cid_create_session_sequence;
 
 	res_EXCHANGE_ID4_ok->eir_flags |= client_record->cr_pnfs_flags;
+	res_EXCHANGE_ID4_ok->eir_flags |= EXCHGID4_FLAG_SUPP_MOVED_REFER;
 
 	res_EXCHANGE_ID4_ok->eir_state_protect.spr_how = SP4_NONE;
 
@@ -364,7 +377,7 @@ int nfs4_op_exchange_id(struct nfs_argop4 *op, compound_data_t *data,
 
  out:
 
-	pthread_mutex_unlock(&client_record->cr_mutex);
+	PTHREAD_MUTEX_unlock(&client_record->cr_mutex);
 
 	/* Release our reference to the client record */
 	dec_client_record_ref(client_record);

@@ -43,9 +43,11 @@
 #include <sys/param.h>
 #include <time.h>
 #include <pthread.h>
+
 #include "log.h"
 #include "hashtable.h"
 #include "gsh_config.h"
+#include "fsal.h"
 #include "cache_inode.h"
 #include "abstract_mem.h"
 
@@ -109,7 +111,7 @@ cache_inode_access_sw(cache_entry_t *entry,
 			goto out;
 	}
 	fsal_status =
-	    pfsal_handle->ops->test_access(pfsal_handle, access_type,
+	    pfsal_handle->obj_ops.test_access(pfsal_handle, access_type,
 					   allowed, denied);
 	if (use_mutex)
 		PTHREAD_RWLOCK_unlock(&entry->attr_lock);
@@ -130,7 +132,7 @@ cache_inode_access_sw(cache_entry_t *entry,
 	return status;
 }
 
-static bool not_in_group_list(gid_t gid)
+bool not_in_group_list(gid_t gid)
 {
 	const struct user_cred *creds = op_ctx->creds;
 	int i;
@@ -323,6 +325,14 @@ cache_inode_check_setattr_perms(cache_entry_t *entry,
 		access_check |= FSAL_ACE4_MASK_SET(FSAL_ACE_PERM_WRITE_ATTR);
 		LogDebugCIA(COMPONENT_CACHE_INODE, COMPONENT_NFS_V4_ACL,
 			    "Change ATIME and/or MTIME requires FSAL_ACE_PERM_WRITE_ATTR");
+	}
+
+	if (access_check == 0) {
+		if (FSAL_TEST_MASK(attr->mask, ATTR_SIZE) && is_open_write)
+			note = " (Ok, open for write)";
+		else
+			note = " (Ok, no permission neccessary)";
+		goto out;
 	}
 
 	if (isDebug(COMPONENT_CACHE_INODE) || isDebug(COMPONENT_NFS_V4_ACL)) {

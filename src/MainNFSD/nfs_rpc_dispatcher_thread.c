@@ -39,7 +39,7 @@
 #include <assert.h>
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
+#include "gsh_rpc.h"
 #include "abstract_atomic.h"
 #include "nfs23.h"
 #include "nfs4.h"
@@ -120,7 +120,8 @@ const char *tags[] = {
 };
 
 typedef struct proto_data {
-	struct sockaddr_in sinaddr;
+	struct sockaddr_in sinaddr_udp;
+	struct sockaddr_in sinaddr_tcp;
 	struct sockaddr_in6 sinaddr_udp6;
 	struct sockaddr_in6 sinaddr_tcp6;
 	struct netbuf netbuf_udp6;
@@ -144,6 +145,9 @@ int tcp_socket[P_COUNT];
 SVCXPRT *udp_xprt[P_COUNT];
 SVCXPRT *tcp_xprt[P_COUNT];
 
+/* Flag to indicate if V6 interfaces on the host are enabled */
+bool v6disabled;
+
 /**
  * @brief Unregister an RPC program.
  *
@@ -158,8 +162,10 @@ static void unregister(const rpcprog_t prog, const rpcvers_t vers1,
 	for (vers = vers1; vers <= vers2; vers++) {
 		rpcb_unset(prog, vers, netconfig_udpv4);
 		rpcb_unset(prog, vers, netconfig_tcpv4);
-		rpcb_unset(prog, vers, netconfig_udpv6);
-		rpcb_unset(prog, vers, netconfig_tcpv6);
+		if (netconfig_udpv6)
+			rpcb_unset(prog, vers, netconfig_udpv6);
+		if (netconfig_tcpv6)
+			rpcb_unset(prog, vers, netconfig_tcpv6);
 	}
 }
 
@@ -181,8 +187,9 @@ static void unregister_rpc(void)
 }
 
 #define test_for_additional_nfs_protocols(p) \
-	((p != P_MNT && p != P_NLM) ||					\
-	 (nfs_param.core_param.core_options &  CORE_OPTION_NFSV3) != 0)
+	((p != P_MNT && p != P_NLM && p != P_RQUOTA) ||		   \
+	 (nfs_param.core_param.core_options & (CORE_OPTION_NFSV3 | \
+					       CORE_OPTION_NFSV4)))
 
 /**
  * @brief Close file descriptors used for RPC services.
@@ -283,14 +290,16 @@ void Create_SVCXPRTs(void)
 }
 
 /**
- * @brief Bind the udp and tcp sockets.
+ * @brief Bind the udp and tcp sockets for V6 Interfaces
  */
-void Bind_sockets(void)
+static int Bind_sockets_V6(void)
 {
 	protos p;
+	int    rc = 0;
 
-	for (p = P_NFS; p < P_COUNT; p++)
+	for (p = P_NFS; p < P_COUNT; p++) {
 		if (test_for_additional_nfs_protocols(p)) {
+
 			proto_data *pdatap = &pdata[p];
 			memset(&pdatap->sinaddr_udp6, 0,
 			       sizeof(pdatap->sinaddr_udp6));
@@ -308,18 +317,23 @@ void Bind_sockets(void)
 			pdatap->bindaddr_udp6.qlen = SOMAXCONN;
 			pdatap->bindaddr_udp6.addr = pdatap->netbuf_udp6;
 
-			if (!__rpc_fd2sockinfo(udp_socket[p], &pdatap->si_udp6))
-				LogFatal(COMPONENT_DISPATCH,
+			if (!__rpc_fd2sockinfo(udp_socket[p],
+			    &pdatap->si_udp6)) {
+				LogWarn(COMPONENT_DISPATCH,
 					 "Cannot get %s socket info for udp6 socket errno=%d (%s)",
 					 tags[p], errno, strerror(errno));
+				return -1;
+			}
 
-			if (bind(udp_socket[p],
-				 (struct sockaddr *)
-				  pdatap->bindaddr_udp6.addr.buf,
-				 (socklen_t) pdatap->si_udp6.si_alen) == -1)
-				LogFatal(COMPONENT_DISPATCH,
+			rc = bind(udp_socket[p],
+			      (struct sockaddr *)pdatap->bindaddr_udp6.addr.buf,
+				  (socklen_t) pdatap->si_udp6.si_alen);
+			if (rc == -1) {
+				LogWarn(COMPONENT_DISPATCH,
 					 "Cannot bind %s udp6 socket, error %d (%s)",
 					 tags[p], errno, strerror(errno));
+				goto exit;
+			}
 
 			memset(&pdatap->sinaddr_tcp6, 0,
 			       sizeof(pdatap->sinaddr_tcp6));
@@ -337,19 +351,307 @@ void Bind_sockets(void)
 			pdatap->bindaddr_tcp6.qlen = SOMAXCONN;
 			pdatap->bindaddr_tcp6.addr = pdatap->netbuf_tcp6;
 
-			if (!__rpc_fd2sockinfo(tcp_socket[p], &pdatap->si_tcp6))
-				LogFatal(COMPONENT_DISPATCH,
+			if (!__rpc_fd2sockinfo(tcp_socket[p],
+			    &pdatap->si_tcp6)) {
+				LogWarn(COMPONENT_DISPATCH,
 					 "Cannot get %s socket info for tcp6 socket errno=%d (%s)",
 					 tags[p], errno, strerror(errno));
+				return -1;
+			}
 
-			if (bind(tcp_socket[p],
-				 (struct sockaddr *)
+			rc = bind(tcp_socket[p],
+				  (struct sockaddr *)
 				   pdatap->bindaddr_tcp6.addr.buf,
-				 (socklen_t) pdatap->si_tcp6.si_alen) == -1)
-				LogFatal(COMPONENT_DISPATCH,
-					 "Cannot bind %s tcp6 socket, error %d (%s)",
-					 tags[p], errno, strerror(errno));
+				 (socklen_t) pdatap->si_tcp6.si_alen);
+			if (rc == -1) {
+				LogWarn(COMPONENT_DISPATCH,
+					"Cannot bind %s tcp6 socket, error %d (%s)",
+					tags[p], errno, strerror(errno));
+				goto exit;
+			}
 		}
+	}
+
+exit:
+	return rc;
+}
+
+/**
+ * @brief Bind the udp and tcp sockets for V4 Interfaces
+ */
+static int Bind_sockets_V4(void)
+{
+	protos p;
+	int    rc = 0;
+
+	for (p = P_NFS; p < P_COUNT; p++) {
+		if (test_for_additional_nfs_protocols(p)) {
+
+			proto_data *pdatap = &pdata[p];
+			memset(&pdatap->sinaddr_udp, 0,
+			       sizeof(pdatap->sinaddr_udp));
+			pdatap->sinaddr_udp.sin_family = AF_INET;
+			/* all interfaces */
+			pdatap->sinaddr_udp.sin_addr.s_addr = htonl(INADDR_ANY);
+			pdatap->sinaddr_udp.sin_port =
+			    htons(nfs_param.core_param.port[p]);
+
+			pdatap->netbuf_udp6.maxlen =
+			    sizeof(pdatap->sinaddr_udp);
+			pdatap->netbuf_udp6.len = sizeof(pdatap->sinaddr_udp);
+			pdatap->netbuf_udp6.buf = &pdatap->sinaddr_udp;
+
+			pdatap->bindaddr_udp6.qlen = SOMAXCONN;
+			pdatap->bindaddr_udp6.addr = pdatap->netbuf_udp6;
+
+			if (!__rpc_fd2sockinfo(udp_socket[p],
+			    &pdatap->si_udp6)) {
+				LogWarn(COMPONENT_DISPATCH,
+					"Cannot get %s socket info for udp6 socket errno=%d (%s)",
+					tags[p], errno, strerror(errno));
+				return -1;
+			}
+
+			rc = bind(udp_socket[p],
+				  (struct sockaddr *)
+				  pdatap->bindaddr_udp6.addr.buf,
+				  (socklen_t) pdatap->si_udp6.si_alen);
+			if (rc == -1) {
+				LogWarn(COMPONENT_DISPATCH,
+					"Cannot bind %s udp6 socket, error %d (%s)",
+					tags[p], errno, strerror(errno));
+				return -1;
+			}
+
+			memset(&pdatap->sinaddr_tcp, 0,
+			       sizeof(pdatap->sinaddr_tcp));
+			pdatap->sinaddr_tcp.sin_family = AF_INET;
+			/* all interfaces */
+			pdatap->sinaddr_tcp.sin_addr.s_addr = htonl(INADDR_ANY);
+			pdatap->sinaddr_tcp.sin_port =
+			    htons(nfs_param.core_param.port[p]);
+
+			pdatap->netbuf_tcp6.maxlen =
+			    sizeof(pdatap->sinaddr_tcp);
+			pdatap->netbuf_tcp6.len = sizeof(pdatap->sinaddr_tcp);
+			pdatap->netbuf_tcp6.buf = &pdatap->sinaddr_tcp;
+
+			pdatap->bindaddr_tcp6.qlen = SOMAXCONN;
+			pdatap->bindaddr_tcp6.addr = pdatap->netbuf_tcp6;
+
+			if (!__rpc_fd2sockinfo(tcp_socket[p],
+			    &pdatap->si_tcp6)) {
+				LogWarn(COMPONENT_DISPATCH,
+					"V4 : Cannot get %s socket info for tcp socket error %d(%s)",
+					tags[p], errno, strerror(errno));
+				return -1;
+			}
+
+			rc = bind(tcp_socket[p],
+				  (struct sockaddr *)
+				  pdatap->bindaddr_tcp6.addr.buf,
+				  (socklen_t) pdatap->si_tcp6.si_alen);
+			if (rc == -1) {
+				LogWarn(COMPONENT_DISPATCH,
+					"Cannot bind %s tcp socket, error %d(%s)",
+					tags[p], errno, strerror(errno));
+				return -1;
+			}
+		}
+	}
+
+	return rc;
+}
+
+void Bind_sockets(void)
+{
+	int	rc = 0;
+
+	/*
+	 * See Allocate_sockets(), which should already
+	 * have set the global v6disabled accordingly
+	 */
+	if (v6disabled) {
+		rc = Bind_sockets_V4();
+		if (rc)
+			LogFatal(COMPONENT_DISPATCH,
+				 "Error binding to V4 interface. Cannot continue.");
+	} else {
+		rc = Bind_sockets_V6();
+		if (rc)
+			LogFatal(COMPONENT_DISPATCH,
+				 "Error binding to V6 interface. Cannot continue.");
+	}
+
+	LogInfo(COMPONENT_DISPATCH,
+		"Bind_sockets() successful, v6disabled = %d", v6disabled);
+
+	return;
+}
+
+/**
+ * @brief Function to set the socket options on the allocated
+ *	  udp and tcp sockets
+ *
+ */
+static int alloc_socket_setopts(int p)
+{
+	int one = 1;
+
+	/* Use SO_REUSEADDR in order to avoid wait
+	 * the 2MSL timeout */
+	if (setsockopt(udp_socket[p],
+		       SOL_SOCKET, SO_REUSEADDR,
+		       &one, sizeof(one))) {
+		LogWarn(COMPONENT_DISPATCH,
+			"Bad udp socket options for %s, error %d(%s)",
+			tags[p], errno, strerror(errno));
+
+		return -1;
+	}
+
+	if (setsockopt(tcp_socket[p],
+		       SOL_SOCKET, SO_REUSEADDR,
+		       &one, sizeof(one))) {
+		LogWarn(COMPONENT_DISPATCH,
+			"Bad tcp socket options for %s, error %d(%s)",
+			tags[p], errno, strerror(errno));
+
+		return -1;
+	}
+
+	/* We prefer using non-blocking socket
+	 * in the specific case */
+	if (fcntl(udp_socket[p], F_SETFL, FNDELAY) == -1) {
+		LogWarn(COMPONENT_DISPATCH,
+			"Cannot set udp socket for %s as non blocking, error %d(%s)",
+			tags[p], errno, strerror(errno));
+
+		return -1;
+	}
+
+	return 0;
+}
+
+/**
+ * @brief Allocate the tcp and udp sockets for the nfs daemon
+ * using V4 interfaces
+ */
+static int Allocate_sockets_V4(int p)
+{
+	udp_socket[p] = socket(AF_INET,
+			       SOCK_DGRAM,
+			       IPPROTO_UDP);
+
+	if (udp_socket[p] == -1) {
+		if (errno == EAFNOSUPPORT) {
+			LogInfo(COMPONENT_DISPATCH,
+				"No V6 and V4 intfs configured?!");
+		}
+
+		LogWarn(COMPONENT_DISPATCH,
+			"Cannot allocate a udp socket for %s, error %d(%s)",
+			tags[p], errno, strerror(errno));
+
+		return -1;
+	}
+
+	tcp_socket[p] = socket(AF_INET,
+			       SOCK_STREAM,
+			       IPPROTO_TCP);
+
+	if (tcp_socket[p] == -1) {
+		LogWarn(COMPONENT_DISPATCH,
+			"Cannot allocate a tcp socket for %s, error %d(%s)",
+			tags[p], errno, strerror(errno));
+		return -1;
+	}
+
+	return 0;
+
+}
+
+/**
+ * @brief Allocate the tcp and udp sockets for the nfs daemon
+ */
+static void Allocate_sockets()
+{
+	protos	p;
+	int	rc = 0;
+
+	LogFullDebug(COMPONENT_DISPATCH, "Allocation of the sockets");
+
+	for (p = P_NFS; p < P_COUNT; p++) {
+		if (test_for_additional_nfs_protocols(p)) {
+			/* Initialize all the sockets to -1 because
+			 * it makes some code later easier */
+			udp_socket[p] = -1;
+			tcp_socket[p] = -1;
+
+			if (v6disabled)
+				goto try_V4;
+
+			udp_socket[p] = socket(AF_INET6,
+					       SOCK_DGRAM,
+					       IPPROTO_UDP);
+
+			if (udp_socket[p] == -1) {
+				/*
+				 * We assume that EAFNOSUPPORT points
+				 * to the likely case when the host has
+				 * V6 interfaces disabled. So we will
+				 * try to use the existing V4 interfaces
+				 * instead
+				 */
+				if (errno == EAFNOSUPPORT) {
+					v6disabled = true;
+					LogWarn(COMPONENT_DISPATCH,
+					    "System may not have V6 intfs configured error %d(%s)",
+					    errno, strerror(errno));
+
+					goto try_V4;
+				}
+
+				LogFatal(COMPONENT_DISPATCH,
+					 "Cannot allocate a udp socket for %s, error %d(%s)",
+					 tags[p], errno, strerror(errno));
+			}
+
+			tcp_socket[p] = socket(AF_INET6,
+					       SOCK_STREAM,
+					       IPPROTO_TCP);
+
+			/* We fail with LogFatal here on error because it
+			 * shouldn't be that we have managed to create a
+			 * V6 based udp socket and have failed for the tcp
+			 * sock. If it were a case of V6 being disabled,
+			 * then we would have encountered that case with
+			 * the first udp sock create and would have moved
+			 * on to create the V4 sockets.
+			 */
+			if (tcp_socket[p] == -1)
+				LogFatal(COMPONENT_DISPATCH,
+					 "Cannot allocate a tcp socket for %s, error %d(%s)",
+					 tags[p], errno, strerror(errno));
+
+try_V4:
+			if (v6disabled) {
+				rc = Allocate_sockets_V4(p);
+				if (rc) {
+					LogFatal(COMPONENT_DISPATCH,
+						 "Error allocating V4 socket for proto %d, %s",
+						 p, tags[p]);
+				}
+			}
+
+			rc = alloc_socket_setopts(p);
+			if (rc) {
+				LogFatal(COMPONENT_DISPATCH,
+					 "Error setting socket option for proto %d, %s",
+					 p, tags[p]);
+			}
+		}
+	}
 }
 
 /* The following routine must ONLY be called from the shutdown
@@ -386,12 +688,14 @@ void Register_program(protos prot, int flag, int vers)
 				 "Cannot register %s V%d on UDP", tags[prot],
 				 (int)vers);
 
-		LogInfo(COMPONENT_DISPATCH, "Registering %s V%d/UDPv6",
-			tags[prot], (int)vers);
-		if (!UDP_REGISTER(prot, vers, netconfig_udpv6))
-			LogFatal(COMPONENT_DISPATCH,
-				 "Cannot register %s V%d on UDPv6", tags[prot],
-				 (int)vers);
+		if (netconfig_udpv6) {
+			LogInfo(COMPONENT_DISPATCH, "Registering %s V%d/UDPv6",
+				tags[prot], (int)vers);
+			if (!UDP_REGISTER(prot, vers, netconfig_udpv6))
+				LogFatal(COMPONENT_DISPATCH,
+					 "Cannot register %s V%d on UDPv6",
+					 tags[prot], (int)vers);
+		}
 
 #ifndef _NO_TCP_REGISTER
 		LogInfo(COMPONENT_DISPATCH, "Registering %s V%d/TCP",
@@ -402,12 +706,14 @@ void Register_program(protos prot, int flag, int vers)
 				 "Cannot register %s V%d on TCP", tags[prot],
 				 (int)vers);
 
-		LogInfo(COMPONENT_DISPATCH, "Registering %s V%d/TCPv6",
-			tags[prot], (int)vers);
-		if (!TCP_REGISTER(prot, vers, netconfig_tcpv6))
-			LogFatal(COMPONENT_DISPATCH,
-				 "Cannot register %s V%d on TCPv6", tags[prot],
-				 (int)vers);
+		if (netconfig_tcpv6) {
+			LogInfo(COMPONENT_DISPATCH, "Registering %s V%d/TCPv6",
+				tags[prot], (int)vers);
+			if (!TCP_REGISTER(prot, vers, netconfig_tcpv6))
+				LogFatal(COMPONENT_DISPATCH,
+					 "Cannot register %s V%d on TCPv6",
+					 tags[prot], (int)vers);
+		}
 #endif				/* _NO_TCP_REGISTER */
 	}
 }
@@ -420,10 +726,8 @@ void Register_program(protos prot, int flag, int vers)
  */
 void nfs_Init_svc()
 {
-	protos p;
 	svc_init_params svc_params;
 	int ix, code __attribute__ ((unused)) = 0;
-	int one = 1;
 
 	LogDebug(COMPONENT_DISPATCH, "NFS INIT: Core options = %d",
 		 nfs_param.core_param.core_options);
@@ -434,6 +738,8 @@ void nfs_Init_svc()
 	LogInfo(COMPONENT_DISPATCH, "NFS INIT: using TIRPC");
 
 	memset(&svc_params, 0, sizeof(svc_params));
+
+	v6disabled = false;
 
 	/* New TI-RPC package init function */
 	svc_params.flags = SVC_INIT_EPOLL;	/* use EPOLL event mgmt */
@@ -505,68 +811,24 @@ void nfs_Init_svc()
 	/* Get the netconfig entries from /etc/netconfig */
 	netconfig_udpv6 = (struct netconfig *)getnetconfigent("udp6");
 	if (netconfig_udpv6 == NULL)
-		LogFatal(COMPONENT_DISPATCH,
+		LogInfo(COMPONENT_DISPATCH,
 			 "Cannot get udp6 netconfig, cannot get an entry for udp6 in netconfig file. Check file /etc/netconfig...");
 
 	/* Get the netconfig entries from /etc/netconfig */
 	netconfig_tcpv6 = (struct netconfig *)getnetconfigent("tcp6");
 	if (netconfig_tcpv6 == NULL)
-		LogFatal(COMPONENT_DISPATCH,
+		LogInfo(COMPONENT_DISPATCH,
 			 "Cannot get tcp6 netconfig, cannot get an entry for tcp in netconfig file. Check file /etc/netconfig...");
 
-	/* A short message to show that /etc/netconfig parsing was a success */
-	LogFullDebug(COMPONENT_DISPATCH, "netconfig found for UDPv6 and TCPv6");
+	/* A short message to show that /etc/netconfig parsing was a success
+	 * for ipv6
+	 */
+	if (netconfig_udpv6 && netconfig_tcpv6)
+		LogFullDebug(COMPONENT_DISPATCH,
+			     "netconfig found for UDPv6 and TCPv6");
 
 	/* Allocate the UDP and TCP sockets for the RPC */
-	LogFullDebug(COMPONENT_DISPATCH, "Allocation of the sockets");
-	for (p = P_NFS; p < P_COUNT; p++)
-		if (test_for_additional_nfs_protocols(p)) {
-			/* Initialize all the sockets to -1 because
-			 * it makes some code later easier */
-			udp_socket[p] = -1;
-			tcp_socket[p] = -1;
-
-			udp_socket[p] = socket(P_FAMILY,
-					       SOCK_DGRAM,
-					       IPPROTO_UDP);
-
-			if (udp_socket[p] == -1)
-				LogFatal(COMPONENT_DISPATCH,
-					 "Cannot allocate a udp socket for %s, error %d (%s)",
-					 tags[p], errno, strerror(errno));
-
-			tcp_socket[p] = socket(P_FAMILY,
-					       SOCK_STREAM,
-					       IPPROTO_TCP);
-
-			if (tcp_socket[p] == -1)
-				LogFatal(COMPONENT_DISPATCH,
-					 "Cannot allocate a tcp socket for %s, error %d (%s)",
-					 tags[p], errno, strerror(errno));
-
-			/* Use SO_REUSEADDR in order to avoid wait
-			 * the 2MSL timeout */
-			if (setsockopt(udp_socket[p],
-				       SOL_SOCKET, SO_REUSEADDR,
-				       &one, sizeof(one)))
-				LogFatal(COMPONENT_DISPATCH,
-					 "Bad udp socket options for %s, error %d (%s)",
-					 tags[p], errno, strerror(errno));
-
-			if (setsockopt(tcp_socket[p],
-				       SOL_SOCKET, SO_REUSEADDR,
-				       &one, sizeof(one)))
-				LogFatal(COMPONENT_DISPATCH,
-					 "Bad tcp socket options for %s, error %d (%s)",
-					 tags[p], errno, strerror(errno));
-
-			/* We prefer using non-blocking socket
-			 * in the specific case */
-			if (fcntl(udp_socket[p], F_SETFL, FNDELAY) == -1)
-				LogFatal(COMPONENT_DISPATCH,
-					 "Cannot set udp socket for %s as non blocking, error %d (%s)",
-					 tags[p], errno, strerror(errno));
-		}
+	Allocate_sockets();
 
 	socket_setoptions(tcp_socket[P_NFS]);
 
@@ -638,7 +900,9 @@ void nfs_Init_svc()
 	Register_program(P_MNT, CORE_OPTION_NFSV3, MOUNT_V3);
 	if (nfs_param.core_param.enable_NLM)
 		Register_program(P_NLM, CORE_OPTION_NFSV3, NLM4_VERS);
-	if (nfs_param.core_param.enable_RQUOTA) {
+	if (nfs_param.core_param.enable_RQUOTA &&
+	    (nfs_param.core_param.core_options & (CORE_OPTION_NFSV3 |
+						  CORE_OPTION_NFSV4))) {
 		Register_program(P_RQUOTA, CORE_OPTION_ALL_VERS, RQUOTAVERS);
 		Register_program(P_RQUOTA, CORE_OPTION_ALL_VERS,
 				 EXT_RQUOTAVERS);
@@ -703,7 +967,7 @@ static u_int nfs_rpc_rdvs(SVCXPRT *xprt, SVCXPRT *newxprt, const u_int flags,
 	static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 	uint32_t tchan;
 
-	pthread_mutex_lock(&mtx);
+	PTHREAD_MUTEX_lock(&mtx);
 
 	tchan = next_chan;
 	assert((next_chan >= TCP_EVCHAN_0) && (next_chan < N_EVENT_CHAN));
@@ -717,7 +981,7 @@ static u_int nfs_rpc_rdvs(SVCXPRT *xprt, SVCXPRT *newxprt, const u_int flags,
 	/* NB: xu->drc is allocated on first request--we need shared
 	 * TCP DRC for v3, but per-connection for v4 */
 
-	pthread_mutex_unlock(&mtx);
+	PTHREAD_MUTEX_unlock(&mtx);
 
 	(void)svc_rqst_evchan_reg(rpc_evchan[tchan].chan_id, newxprt,
 				  SVC_RQST_FLAG_NONE);
@@ -787,11 +1051,11 @@ void thr_stallq(struct fridgethr_context *thr_ctx)
 
 	while (1) {
 		thread_delay_ms(1000);
-		pthread_mutex_lock(&nfs_req_st.stallq.mtx);
+		PTHREAD_MUTEX_lock(&nfs_req_st.stallq.mtx);
  restart:
 		if (nfs_req_st.stallq.stalled == 0) {
-			nfs_req_st.stallq.active = FALSE;
-			pthread_mutex_unlock(&nfs_req_st.stallq.mtx);
+			nfs_req_st.stallq.active = false;
+			PTHREAD_MUTEX_unlock(&nfs_req_st.stallq.mtx);
 			break;
 		}
 
@@ -802,24 +1066,29 @@ void thr_stallq(struct fridgethr_context *thr_ctx)
 				xprt = xu->xprt;
 				/* lock ordering
 				 * (cf. nfs_rpc_cond_stall_xprt) */
-				pthread_mutex_unlock(&nfs_req_st.stallq.mtx);
+				PTHREAD_MUTEX_unlock(&nfs_req_st.stallq.mtx);
 				/* !LOCKED */
 				LogDebug(COMPONENT_DISPATCH,
 					 "unstalling stalled xprt %p", xprt);
-				pthread_mutex_lock(&xprt->xp_lock);
-				pthread_mutex_lock(&nfs_req_st.stallq.mtx);
-				glist_del(&xu->stallq);
-				--(nfs_req_st.stallq.stalled);
-				xu->flags &= ~XPRT_PRIVATE_FLAG_STALLED;
-				(void)svc_rqst_rearm_events(
-					xprt, SVC_RQST_FLAG_NONE);
-				/* drop stallq ref */
-				gsh_xprt_unref(xprt, XPRT_PRIVATE_FLAG_LOCKED,
-					       __func__, __LINE__);
+				PTHREAD_MUTEX_lock(&xprt->xp_lock);
+				PTHREAD_MUTEX_lock(&nfs_req_st.stallq.mtx);
+				/* check that we're still stalled */
+				if (xu->flags & XPRT_PRIVATE_FLAG_STALLED) {
+					glist_del(&xu->stallq);
+					--(nfs_req_st.stallq.stalled);
+					xu->flags &=
+						~XPRT_PRIVATE_FLAG_STALLED;
+					(void)svc_rqst_rearm_events(
+						xprt, SVC_RQST_FLAG_NONE);
+					/* drop stallq ref */
+					gsh_xprt_unref(
+						xprt, XPRT_PRIVATE_FLAG_LOCKED,
+						__func__, __LINE__);
+				}
 				goto restart;
 			}
 		}
-		pthread_mutex_unlock(&nfs_req_st.stallq.mtx);
+		PTHREAD_MUTEX_unlock(&nfs_req_st.stallq.mtx);
 	}
 
 	LogDebug(COMPONENT_DISPATCH, "stallq idle, thread exit");
@@ -828,10 +1097,10 @@ void thr_stallq(struct fridgethr_context *thr_ctx)
 static bool nfs_rpc_cond_stall_xprt(SVCXPRT *xprt)
 {
 	gsh_xprt_private_t *xu;
-	bool activate = FALSE;
+	bool activate = false;
 	uint32_t nreqs;
 
-	pthread_mutex_lock(&xprt->xp_lock);
+	PTHREAD_MUTEX_lock(&xprt->xp_lock);
 
 	xu = (gsh_xprt_private_t *) xprt->xp_u1;
 	nreqs = xu->req_cnt;
@@ -843,35 +1112,35 @@ static bool nfs_rpc_cond_stall_xprt(SVCXPRT *xprt)
 
 	/* check per-xprt quota */
 	if (likely(nreqs < nfs_param.core_param.dispatch_max_reqs_xprt)) {
-		pthread_mutex_unlock(&xprt->xp_lock);
-		return FALSE;
+		PTHREAD_MUTEX_unlock(&xprt->xp_lock);
+		return false;
 	}
 
 	/* XXX can't happen */
 	if (unlikely(xu->flags & XPRT_PRIVATE_FLAG_STALLED)) {
-		pthread_mutex_unlock(&xprt->xp_lock);
+		PTHREAD_MUTEX_unlock(&xprt->xp_lock);
 		LogDebug(COMPONENT_DISPATCH, "xprt %p already stalled (oops)",
 			 xprt);
-		return TRUE;
+		return true;
 	}
 
 	LogDebug(COMPONENT_DISPATCH, "xprt %p has %u reqs, marking stalled",
 		 xprt, nreqs);
 
 	/* ok, need to stall */
-	pthread_mutex_lock(&nfs_req_st.stallq.mtx);
+	PTHREAD_MUTEX_lock(&nfs_req_st.stallq.mtx);
 
 	glist_add_tail(&nfs_req_st.stallq.q, &xu->stallq);
 	++(nfs_req_st.stallq.stalled);
 	xu->flags |= XPRT_PRIVATE_FLAG_STALLED;
-	pthread_mutex_unlock(&xprt->xp_lock);
+	PTHREAD_MUTEX_unlock(&xprt->xp_lock);
 
 	/* if no thread is servicing the stallq, start one */
 	if (!nfs_req_st.stallq.active) {
-		nfs_req_st.stallq.active = TRUE;
-		activate = TRUE;
+		nfs_req_st.stallq.active = true;
+		activate = true;
 	}
-	pthread_mutex_unlock(&nfs_req_st.stallq.mtx);
+	PTHREAD_MUTEX_unlock(&nfs_req_st.stallq.mtx);
 
 	if (activate) {
 		int rc = 0;
@@ -884,7 +1153,7 @@ static bool nfs_rpc_cond_stall_xprt(SVCXPRT *xprt)
 	}
 
 	/* stalled */
-	return TRUE;
+	return true;
 }
 
 void nfs_rpc_queue_init(void)
@@ -929,12 +1198,22 @@ void nfs_rpc_queue_init(void)
 	/* stallq */
 	gsh_mutex_init(&nfs_req_st.stallq.mtx, NULL);
 	glist_init(&nfs_req_st.stallq.q);
-	nfs_req_st.stallq.active = FALSE;
+	nfs_req_st.stallq.active = false;
 	nfs_req_st.stallq.stalled = 0;
 }
 
 static uint32_t enqueued_reqs;
 static uint32_t dequeued_reqs;
+
+uint32_t get_enqueue_count()
+{
+	return enqueued_reqs;
+}
+
+uint32_t get_dequeue_count()
+{
+	return dequeued_reqs;
+}
 
 void nfs_rpc_enqueue_req(request_data_t *req)
 {
@@ -1013,12 +1292,12 @@ void nfs_rpc_enqueue_req(request_data_t *req)
 			--(wqe->waiters);
 			/* ! SPIN LOCKED */
 			pthread_spin_unlock(&nfs_req_st.reqs.sp);
-			pthread_mutex_lock(&wqe->lwe.mtx);
+			PTHREAD_MUTEX_lock(&wqe->lwe.mtx);
 			/* XXX reliable handoff */
 			wqe->flags |= Wqe_LFlag_SyncDone;
 			if (wqe->flags & Wqe_LFlag_WaitSync)
 				pthread_cond_signal(&wqe->lwe.cv);
-			pthread_mutex_unlock(&wqe->lwe.mtx);
+			PTHREAD_MUTEX_unlock(&wqe->lwe.mtx);
 		} else
 			/* ! SPIN LOCKED */
 			pthread_spin_unlock(&nfs_req_st.reqs.sp);
@@ -1145,7 +1424,7 @@ request_data_t *nfs_rpc_dequeue_req(nfs_worker_data_t *worker)
 	if (!nfsreq) {
 		wait_q_entry_t *wqe = &worker->wqe;
 		assert(wqe->waiters == 0); /* wqe is not on any wait queue */
-		pthread_mutex_lock(&wqe->lwe.mtx);
+		PTHREAD_MUTEX_lock(&wqe->lwe.mtx);
 		wqe->flags = Wqe_LFlag_WaitSync;
 		wqe->waiters = 1;
 		/* XXX functionalize */
@@ -1174,7 +1453,7 @@ request_data_t *nfs_rpc_dequeue_req(nfs_worker_data_t *worker)
 					      Wqe_LFlag_SyncDone);
 				}
 				pthread_spin_unlock(&nfs_req_st.reqs.sp);
-				pthread_mutex_unlock(&wqe->lwe.mtx);
+				PTHREAD_MUTEX_unlock(&wqe->lwe.mtx);
 				return NULL;
 			}
 		}
@@ -1182,7 +1461,7 @@ request_data_t *nfs_rpc_dequeue_req(nfs_worker_data_t *worker)
 		/* XXX wqe was removed from nfs_req_st.waitq
 		 * (by signalling thread) */
 		wqe->flags &= ~(Wqe_LFlag_WaitSync | Wqe_LFlag_SyncDone);
-		pthread_mutex_unlock(&wqe->lwe.mtx);
+		PTHREAD_MUTEX_unlock(&wqe->lwe.mtx);
 		LogFullDebug(COMPONENT_DISPATCH, "wqe wakeup %p", wqe);
 		goto retry_deq;
 	}
@@ -1263,8 +1542,8 @@ static inline enum auth_stat AuthenticateRequest(struct fridgethr_context
 	struct rpc_msg *msg = req->rq_msg;
 	SVCXPRT *xprt = nfsreq->xprt;
 	enum auth_stat why;
-	bool rlocked = TRUE;
-	bool slocked = FALSE;
+	bool rlocked = true;
+	bool slocked = false;
 
 	/* A few words of explanation are required here:
 	 * In authentication is AUTH_NONE or AUTH_UNIX, then the value of
@@ -1321,9 +1600,9 @@ static inline enum xprt_stat nfs_rpc_continue_decoding(SVCXPRT *xprt,
 	gsh_xprt_private_t *xu = (gsh_xprt_private_t *) xprt->xp_u1;
 	uint32_t nreqs;
 
-	pthread_mutex_lock(&xprt->xp_lock);
+	PTHREAD_MUTEX_lock(&xprt->xp_lock);
 	nreqs = xu->req_cnt;
-	pthread_mutex_unlock(&xprt->xp_lock);
+	PTHREAD_MUTEX_unlock(&xprt->xp_lock);
 
 	/* check per-xprt quota */
 	if (unlikely(nreqs > nfs_param.core_param.dispatch_max_reqs_xprt))
@@ -1361,11 +1640,11 @@ static inline enum xprt_stat nfs_rpc_continue_decoding(SVCXPRT *xprt,
 static bool is_rpc_call_valid(nfs_request_data_t *reqnfs)
 {
 	struct svc_req *req = &reqnfs->req;
-	bool slocked = FALSE;
+	bool slocked = false;
 	/* This function is only ever called from one point, and the
 	   read-lock is always held at that call.  If this changes,
 	   we'll have to pass in the value of rlocked. */
-	bool rlocked = TRUE;
+	bool rlocked = true;
 	int lo_vers, hi_vers;
 
 	if (req->rq_prog == nfs_param.core_param.program[P_NFS]) {
@@ -1486,14 +1765,14 @@ static bool is_rpc_call_valid(nfs_request_data_t *reqnfs)
 	return false;
 }				/* is_rpc_call_valid */
 
-static inline enum xprt_stat thr_decode_rpc_request(struct fridgethr_context
+enum xprt_stat thr_decode_rpc_request(struct fridgethr_context
 						    *thr_ctx, SVCXPRT *xprt)
 {
 	request_data_t *nfsreq;
 	enum xprt_stat stat = XPRT_IDLE;
-	bool no_dispatch = TRUE;
-	bool rlocked = FALSE;
-	bool enqueued = FALSE;
+	bool no_dispatch = true;
+	bool rlocked = false;
+	bool enqueued = false;
 	bool recv_status;
 
 	LogDebug(COMPONENT_DISPATCH, "enter");
@@ -1505,7 +1784,7 @@ static inline enum xprt_stat thr_decode_rpc_request(struct fridgethr_context
 
 	LogFullDebug(COMPONENT_DISPATCH,
 		     "SVC_RECV on socket %d returned %s, xid=%u", xprt->xp_fd,
-		     (recv_status) ? "TRUE" : "FALSE",
+		     (recv_status) ? "true" : "false",
 		     (nfsreq->r_u.nfs->req.rq_msg) ? nfsreq->r_u.nfs->req.
 		     rq_msg->rm_xid : 0);
 
@@ -1581,7 +1860,7 @@ static inline enum xprt_stat thr_decode_rpc_request(struct fridgethr_context
 		/* XXX as above, the call has already passed is_rpc_call_valid,
 		 * the former check here is removed. */
 		nfs_rpc_enqueue_req(nfsreq);
-		enqueued = TRUE;
+		enqueued = true;
 	}
 
  finish:
@@ -1609,13 +1888,13 @@ static inline bool thr_continue_decoding(SVCXPRT *xprt, enum xprt_stat stat)
 	gsh_xprt_private_t *xu;
 	uint32_t nreqs;
 
-	pthread_mutex_lock(&xprt->xp_lock);
+	PTHREAD_MUTEX_lock(&xprt->xp_lock);
 	xu = (gsh_xprt_private_t *) xprt->xp_u1;
 	nreqs = xu->req_cnt;
-	pthread_mutex_unlock(&xprt->xp_lock);
+	PTHREAD_MUTEX_unlock(&xprt->xp_lock);
 
 	if (unlikely(nreqs > nfs_param.core_param.dispatch_max_reqs_xprt))
-		return FALSE;
+		return false;
 
 	return (stat == XPRT_MOREREQS);
 }
@@ -1791,7 +2070,7 @@ static bool nfs_rpc_getreq_ng(SVCXPRT *xprt /*, int chan_id */)
 	LogFullDebug(COMPONENT_DISPATCH, "after fridgethr_get");
 
  out:
-	return TRUE;
+	return true;
 }
 
 /**
@@ -1828,8 +2107,8 @@ int nfs_rpc_get_args(struct fridgethr_context *thr_ctx,
 	SVCXPRT *xprt = reqnfs->xprt;
 	nfs_arg_t *arg_nfs = &reqnfs->arg_nfs;
 	struct svc_req *req = &reqnfs->req;
-	bool rlocked = TRUE;
-	bool slocked = FALSE;
+	bool rlocked = true;
+	bool slocked = false;
 
 	memset(arg_nfs, 0, sizeof(nfs_arg_t));
 

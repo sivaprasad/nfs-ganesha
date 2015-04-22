@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include "nfs_core.h"
+#include "nfs_exports.h"
 #include "log.h"
 #include "cache_inode.h"
 #include "fsal.h"
@@ -95,6 +96,11 @@ int _9p_mknod(struct _9p_request_data *req9p, void *worker_data,
 		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
 				  preply);
 	}
+
+	if ((pfid->op_context.export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
+				  preply);
 
 	op_ctx = &pfid->op_context;
 	snprintf(obj_name, MAXNAMLEN, "%.*s", *name_len, name_str);

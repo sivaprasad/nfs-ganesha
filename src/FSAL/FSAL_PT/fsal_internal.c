@@ -128,7 +128,7 @@ fsal_status_t fsal_internal_handle2fd_at(const struct req_op_context *
 	if (!myself || !pfd)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
-        ptfsal_print_handle(myself->handle->data.handle.f_handle);
+	ptfsal_print_handle(myself->handle->data.handle.f_handle);
 
 	FSI_TRACE(FSI_DEBUG, "Handle Type: %d",
 		  myself->handle->data.handle.handle_type);
@@ -534,8 +534,8 @@ fsal_internal_testAccess_no_acl(const struct req_op_context *p_context,
  *  fsal_error_is_info:
  *  Indicates if an FSAL error should be posted as an INFO level debug msg.
  *  \param status(input): The fsal status whom event is to be tested.
- *  \return - TRUE if the error event is to be posted.
- *          - FALSE if the error event is NOT to be posted.
+ *  \return - true if the error event is to be posted.
+ *          - false if the error event is NOT to be posted.
  */
 bool_t fsal_error_is_info(fsal_status_t status)
 {
@@ -564,10 +564,10 @@ bool_t fsal_error_is_info(fsal_status_t status)
 	case ERR_FSAL_DEADLOCK:
 	case ERR_FSAL_INTERRUPT:
 	case ERR_FSAL_SERVERFAULT:
-		return TRUE;
+		return true;
 
 	default:
-		return FALSE;
+		return false;
 	}
 }
 
@@ -575,8 +575,8 @@ bool_t fsal_error_is_info(fsal_status_t status)
  *  fsal_error_is_event:
  *  Indicates if an FSAL error should be posted as an event
  *  \param status(input): The fsal status whom event is to be tested.
- *  \return - TRUE if the error event is to be posted.
- *          - FALSE if the error event is NOT to be posted.
+ *  \return - true if the error event is to be posted.
+ *          - false if the error event is NOT to be posted.
  *
  */
 bool_t fsal_error_is_event(fsal_status_t status)
@@ -586,9 +586,9 @@ bool_t fsal_error_is_event(fsal_status_t status)
 
 	case ERR_FSAL_IO:
 	case ERR_FSAL_STALE:
-		return TRUE;
+		return true;
 
 	default:
-		return FALSE;
+		return false;
 	}
 }

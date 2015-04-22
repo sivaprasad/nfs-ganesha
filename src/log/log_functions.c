@@ -45,17 +45,21 @@
 #include <sys/resource.h>
 
 #include "log.h"
-#include "ganesha_list.h"
+#include "gsh_list.h"
 #include "rpc/rpc.h"
 #include "common_utils.h"
 #include "abstract_mem.h"
 
 #ifdef USE_DBUS
-#include "ganesha_dbus.h"
+#include "gsh_dbus.h"
 #endif
 
 #include "nfs_core.h"
 #include "config_parsing.h"
+
+#ifdef USE_LTTNG
+#include "gsh_lttng/logger.h"
+#endif
 
 /*
  * The usual PTHREAD_RWLOCK_xxx macros log messages for tracing if FULL
@@ -229,8 +233,6 @@ log_header_t max_headers = LH_COMPONENT;
 
 char const_log_str[LOG_BUFF_LEN];
 char date_time_fmt[MAX_TD_FMT_LEN];
-char user_date_fmt[MAX_TD_USER_LEN];
-char user_time_fmt[MAX_TD_USER_LEN];
 
 typedef struct loglev {
 	char *str;
@@ -328,14 +330,14 @@ static struct tm *Localtime_r(const time_t *p_time, struct tm *p_tm)
 		return NULL;
 	}
 
-	pthread_mutex_lock(&mutex_localtime);
+	PTHREAD_MUTEX_lock(&mutex_localtime);
 
 	p_tmp_tm = localtime(p_time);
 
 	/* copy the result */
 	(*p_tm) = (*p_tmp_tm);
 
-	pthread_mutex_unlock(&mutex_localtime);
+	PTHREAD_MUTEX_unlock(&mutex_localtime);
 
 	return p_tm;
 }
@@ -493,7 +495,7 @@ void SetComponentLogLevel(log_components_t component, int level_to_set)
 	}
 }
 
-inline int ReturnLevelDebug()
+static inline int ReturnLevelDebug()
 {
 	return component_log_level[COMPONENT_ALL];
 }				/* ReturnLevelDebug */
@@ -547,14 +549,16 @@ void set_const_log_str()
 	if (b_left > 0
 	    && (logfields->disp_prog || logfields->disp_pid)
 	    && !logfields->disp_threadname)
-		b_left = display_cat(&dspbuf, " ");
+		(void) display_cat(&dspbuf, " ");
 
 	b_left = display_start(&tdfbuf);
 
+	if (b_left <= 0)
+		return;
+
 	if (logfields->datefmt == TD_LOCAL
 	    && logfields->timefmt == TD_LOCAL) {
-		if (b_left > 0)
-			b_left = display_cat(&tdfbuf, "%c ");
+		b_left = display_cat(&tdfbuf, "%c ");
 	} else {
 		switch (logfields->datefmt) {
 		case TD_GANESHA:
@@ -576,12 +580,16 @@ void set_const_log_str()
 				b_left = display_cat(&tdfbuf, "%F ");
 			break;
 		case TD_USER:
-			b_left = display_printf(&tdfbuf, "%s ", user_date_fmt);
+			b_left = display_printf(&tdfbuf, "%s ",
+				logfields->user_date_fmt);
 			break;
 		case TD_NONE:
 		default:
 			break;
 		}
+
+		if (b_left <= 0)
+			return;
 
 		switch (logfields->timefmt) {
 		case TD_GANESHA:
@@ -596,7 +604,8 @@ void set_const_log_str()
 			b_left = display_cat(&tdfbuf, "T%H:%M:%S.%%06u%z ");
 			break;
 		case TD_USER:
-			b_left = display_printf(&tdfbuf, "%s ", user_time_fmt);
+			b_left = display_printf(&tdfbuf, "%s ",
+				logfields->user_time_fmt);
 			break;
 		case TD_NONE:
 		default:
@@ -1431,6 +1440,11 @@ void display_log_component_level(log_components_t component, char *file,
 	if (b_left > 0)
 		b_left = display_vprintf(&dsp_log, format, arguments);
 
+#ifdef USE_LTTNG
+	tracepoint(ganesha_logger, log,
+		   component, level, file, line, function, message);
+#endif
+
 	PTHREAD_RWLOCK_rdlock(&log_rwlock);
 
 	glist_for_each(glist, &active_facility_list) {
@@ -1492,7 +1506,8 @@ static log_levels_t default_log_levels[] = {
 	[COMPONENT_9P] = NIV_EVENT,
 	[COMPONENT_9P_DISPATCH] = NIV_EVENT,
 	[COMPONENT_FSAL_UP] = NIV_EVENT,
-	[COMPONENT_DBUS] = NIV_EVENT
+	[COMPONENT_DBUS] = NIV_EVENT,
+	[COMPONENT_NFS_MSK] = NIV_EVENT
 };
 
 log_levels_t *component_log_level = default_log_levels;
@@ -1602,7 +1617,10 @@ struct log_component_info LogComponents[COMPONENT_COUNT] = {
 		.comp_str = "FSAL_UP",},
 	[COMPONENT_DBUS] = {
 		.comp_name = "COMPONENT_DBUS",
-		.comp_str = "DBUS",}
+		.comp_str = "DBUS",},
+	[COMPONENT_NFS_MSK] = {
+		.comp_name = "COMPONENT_NFS_MSK",
+		.comp_str = "NFS_MSK",}
 };
 
 void DisplayLogComponentLevel(log_components_t component, char *file, int line,
@@ -1656,12 +1674,19 @@ static bool dbus_prop_get(log_components_t component, DBusMessageIter *reply)
 static bool dbus_prop_set(log_components_t component, DBusMessageIter *arg)
 {
 	char *level_code;
-	long log_level;
+	int log_level;
 
 	if (dbus_message_iter_get_arg_type(arg) != DBUS_TYPE_STRING)
 		return false;
 	dbus_message_iter_get_basic(arg, &level_code);
 	log_level = ReturnLevelAscii(level_code);
+	if (log_level == -1) {
+		LogDebug(COMPONENT_DBUS,
+			 "Invalid log level: '%s' given for component %s",
+			 level_code, LogComponents[component].comp_name);
+		return false;
+	}
+
 	if (component == COMPONENT_ALL) {
 		_SetLevelDebug(log_level);
 		LogChanges("Dbus set log level for all components to %s",
@@ -1745,6 +1770,7 @@ HANDLE_PROP(9P);
 HANDLE_PROP(9P_DISPATCH);
 HANDLE_PROP(FSAL_UP);
 HANDLE_PROP(DBUS);
+HANDLE_PROP(NFS_MSK);
 
 static struct gsh_dbus_prop *log_props[] = {
 	LOG_PROPERTY_ITEM(ALL),
@@ -1782,6 +1808,7 @@ static struct gsh_dbus_prop *log_props[] = {
 	LOG_PROPERTY_ITEM(9P_DISPATCH),
 	LOG_PROPERTY_ITEM(FSAL_UP),
 	LOG_PROPERTY_ITEM(DBUS),
+	LOG_PROPERTY_ITEM(NFS_MSK),
 	NULL
 };
 
@@ -2073,6 +2100,8 @@ static struct config_item component_levels[] = {
 			 COMPONENT_FSAL_UP, int),
 	CONF_INDEX_TOKEN("DBUS", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_DBUS, int),
+	CONF_INDEX_TOKEN("COMPONENT_NFS_MSK", NB_LOG_LEVEL, log_levels,
+			 COMPONENT_NFS_MSK, int),
 	CONFIG_EOL
 };
 
@@ -2489,18 +2518,18 @@ struct config_block logging_param = {
  * @return 0 if ok, -1 if failed,
  *
  */
-int read_log_config(config_file_t in_config)
+int read_log_config(config_file_t in_config,
+		    struct config_error_type *err_type)
 {
 	struct logger_config logger;
-	struct config_error_type err_type;
 
 	memset(&logger, 0, sizeof(struct logger_config));
 	(void)load_config_from_parse(in_config,
 				     &logging_param,
 				     &logger,
 				     true,
-				     &err_type);
-	if (config_error_is_harmless(&err_type))
+				     err_type);
+	if (config_error_is_harmless(err_type))
 		return 0;
 	else
 		return -1;
@@ -2526,6 +2555,9 @@ void reread_log_config()
 		return;
 	}
 
+	/* Create a memstream for parser+processing error messages */
+	if (!init_error_type(&err_type))
+		return;
 	/* Attempt to parse the new configuration file */
 	config_struct = config_ParseFile(config_path, &err_type);
 	if (!config_error_no_error(&err_type)) {
@@ -2533,13 +2565,15 @@ void reread_log_config()
 		LogCrit(COMPONENT_CONFIG,
 			"Error while parsing new configuration file %s",
 			config_path);
+		report_config_errors(&err_type, NULL, config_errs_to_log);
 		return;
 	}
 
 	/* Create the new exports list */
-	status = read_log_config(config_struct);
+	status = read_log_config(config_struct, &err_type);
 	if (status < 0)
 		LogCrit(COMPONENT_CONFIG, "Error while parsing LOG entries");
 
+	report_config_errors(&err_type, NULL, config_errs_to_log);
 	config_Free(config_struct);
 }

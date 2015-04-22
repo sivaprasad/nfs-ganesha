@@ -34,6 +34,7 @@
 #include "log.h"
 #include "nfs_core.h"
 #include "nfs_exports.h"
+#include "nfs_ip_stats.h"
 #include "config_parsing.h"
 #include <stdlib.h>
 #include <string.h>
@@ -110,7 +111,7 @@ int display_ip_name_key(struct gsh_buffdesc *pbuff, char *str)
 {
 	sockaddr_t *addr = (sockaddr_t *) (pbuff->addr);
 
-	sprint_sockaddr(addr, str, HASHTABLE_DISPLAY_STRLEN);
+	sprint_sockip(addr, str, HASHTABLE_DISPLAY_STRLEN);
 	return strlen(str);
 }
 
@@ -132,12 +133,12 @@ int display_ip_name_val(struct gsh_buffdesc *pbuff, char *str)
 
 /**
  *
- * nfs_ip_name_add: adds an entry in the duplicate requests cache.
+ * nfs_ip_name_add: adds an entry into IP/name cache.
  *
  * Adds an entry in the duplicate requests cache.
  *
  * @param ipaddr           [IN]    the ipaddr to be used as key
- * @param hostname         [IN]    the hostname added (found by using gethostbyaddr)
+ * @param hostname         [OUT]    the hostname added (found by using getnameinfo)
  *
  * @return IP_NAME_SUCCESS if successfull\n.
  * @return IP_NAME_INSERT_MALLOC_ERROR if an error occured during the insertion process \n
@@ -181,7 +182,7 @@ int nfs_ip_name_add(sockaddr_t *ipaddr, char *hostname, size_t size)
 	gettimeofday(&tv1, NULL);
 	timersub(&tv1, &tv0, &dur);
 
-	sprint_sockaddr(pipaddr, ipstring, sizeof(ipstring));
+	sprint_sockip(pipaddr, ipstring, sizeof(ipstring));
 
 	/* display warning if DNS resolution took more that 1.0s */
 	if (dur.tv_sec >= 1) {
@@ -193,13 +194,11 @@ int nfs_ip_name_add(sockaddr_t *ipaddr, char *hostname, size_t size)
 
 	/* Ask for the name to be cached */
 	if (rc != 0) {
+		strmaxcpy(nfs_ip_name->hostname, ipstring,
+			sizeof(nfs_ip_name->hostname));
 		LogEvent(COMPONENT_DISPATCH,
-			 "Cannot resolve address %s, error %s", ipstring,
-			 gai_strerror(rc));
-
-		gsh_free(nfs_ip_name);
-		gsh_free(pipaddr);
-		return IP_NAME_NETDB_ERROR;
+			 "Cannot resolve address %s, error %s, using %s as hostname",
+			 ipstring, gai_strerror(rc), nfs_ip_name->hostname);
 	}
 
 	LogDebug(COMPONENT_DISPATCH, "Inserting %s->%s to addr cache", ipstring,
@@ -241,7 +240,7 @@ int nfs_ip_name_get(sockaddr_t *ipaddr, char *hostname, size_t size)
 	nfs_ip_name_t *nfs_ip_name;
 	char ipstring[SOCK_NAME_MAX + 1];
 
-	sprint_sockaddr(ipaddr, ipstring, sizeof(ipstring));
+	sprint_sockip(ipaddr, ipstring, sizeof(ipstring));
 
 	buffkey.addr = (caddr_t) ipaddr;
 	buffkey.len = sizeof(sockaddr_t);
@@ -280,7 +279,7 @@ int nfs_ip_name_remove(sockaddr_t *ipaddr)
 	nfs_ip_name_t *nfs_ip_name = NULL;
 	char ipstring[SOCK_NAME_MAX + 1];
 
-	sprint_sockaddr(ipaddr, ipstring, sizeof(ipstring));
+	sprint_sockip(ipaddr, ipstring, sizeof(ipstring));
 
 	buffkey.addr = (caddr_t) ipaddr;
 	buffkey.len = sizeof(sockaddr_t);

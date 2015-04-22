@@ -35,7 +35,7 @@
 #include <sys/file.h>		/* for having FNDELAY */
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
+#include "gsh_rpc.h"
 #include "nfs23.h"
 #include "nfs4.h"
 #include "mount.h"
@@ -53,7 +53,6 @@
  * Get attributes for a file. Implements NFSPROC3_GETATTR.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  export  NFS export list
  * @param[in]  worker  Data belonging to the worker thread
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call

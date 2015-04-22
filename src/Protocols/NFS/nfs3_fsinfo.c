@@ -36,9 +36,7 @@
 #include <pthread.h>
 #include "hashtable.h"
 #include "log.h"
-#include "nfs23.h"
-#include "nfs4.h"
-#include "mount.h"
+#include "fsal.h"
 #include "nfs_core.h"
 #include "cache_inode.h"
 #include "nfs_exports.h"
@@ -55,7 +53,6 @@
  * retrieving information from the FSAL as it ought.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  export  NFS export list
  * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
@@ -112,7 +109,7 @@ int nfs3_fsinfo(nfs_arg_t *arg,
 	FSINFO_FIELD->dtpref = op_ctx->export->PrefReaddir;
 
 	FSINFO_FIELD->maxfilesize =
-	    op_ctx->fsal_export->ops->fs_maxfilesize(op_ctx->fsal_export);
+	    op_ctx->fsal_export->exp_ops.fs_maxfilesize(op_ctx->fsal_export);
 	FSINFO_FIELD->time_delta.tv_sec = 1;
 	FSINFO_FIELD->time_delta.tv_nsec = 0;
 

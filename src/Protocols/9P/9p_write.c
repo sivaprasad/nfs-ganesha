@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include "nfs_core.h"
+#include "nfs_exports.h"
 #include "log.h"
 #include "cache_inode.h"
 #include "fsal.h"
@@ -98,6 +99,11 @@ int _9p_write(struct _9p_request_data *req9p, void *worker_data,
 				  preply);
 	}
 
+	if ((pfid->op_context.export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
+				  preply);
+
 	op_ctx = &pfid->op_context;
 
 	/* Do the job */
@@ -107,7 +113,7 @@ int _9p_write(struct _9p_request_data *req9p, void *worker_data,
 		memcpy(pfid->specdata.xattr.xattr_content + (*offset),
 		       databuffer, size);
 		pfid->specdata.xattr.xattr_offset += size;
-		pfid->specdata.xattr.xattr_write = TRUE;
+		pfid->specdata.xattr.xattr_write = true;
 
 		/* ADD CODE TO DETECT GAP */
 #if 0

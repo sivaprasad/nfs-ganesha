@@ -45,8 +45,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+
 #include "nfs4.h"
-#include "fsal_types.h"
+#include "gsh_rpc.h"
 
 /**
  * @brief An enumeration of protocols in the NFS family
@@ -168,9 +169,20 @@ typedef enum protos {
 #define CORE_OPTION_NFSV4 0x00000002	/*< NFSv4 operations are supported */
 
 /**
+ * @brief Support 9p
+ */
+#define CORE_OPTION_9P 0x00000004	/*< NFSv4 operations are supported */
+
+/**
  * @brief Support NFSv3 and NFSv4.
  */
-#define CORE_OPTION_ALL_VERS (CORE_OPTION_NFSV3 | CORE_OPTION_NFSV4)
+#define CORE_OPTION_ALL_NFS_VERS (CORE_OPTION_NFSV3 | CORE_OPTION_NFSV4)
+
+/**
+ * @brief Support all protocols
+ */
+#define CORE_OPTION_ALL_VERS (CORE_OPTION_NFSV3 | CORE_OPTION_NFSV4 | \
+			      CORE_OPTION_9P)
 
 typedef struct nfs_core_param {
 	/** An array of port numbers, one for each protocol.  Set by
@@ -341,6 +353,8 @@ typedef struct nfs_core_param {
 	/** Path to the directory containing server specific
 	    modules.  In particular, this is where FSALs live. */
 	char *ganesha_modules_loc;
+	/* Frequency of dbus health heartbeat in ms. Set to 0 to disable */
+	uint32_t heartbeat_freq;
 } nfs_core_parameter_t;
 
 /** @} */
@@ -366,13 +380,20 @@ typedef struct nfs_core_param {
  */
 #define DOMAINNAME_DEFAULT "localdomain"
 
+/**
+ * @brief Default value of idmapconf.
+ */
+#define IDMAPCONF_DEFAULT "/etc/idmapd.conf"
+
+/**
+ * @brief Default value of deleg_recall_retry_delay.
+ */
+#define DELEG_RECALL_RETRY_DELAY_DEFAULT 1
+
 typedef struct nfs_version4_parameter {
 	/** Whether to disable the NFSv4 grace period.  Defaults to
 	    false and settable with Graceless. */
 	bool graceless;
-	/** Whether to grace period handled by FSAL.  Defaults to
-	    false and settable with FSAL_Grace. */
-	bool fsal_grace;
 	/** The NFSv4 lease lifetime.  Defaults to
 	    LEASE_LIFETIME_DEFAULT and is settable with
 	    Lease_Lifetime. */
@@ -398,6 +419,12 @@ typedef struct nfs_version4_parameter {
 	/** Whether to allow delegations. Defaults to false and settable
 	    with Delegations */
 	bool allow_delegations;
+	/** Delay after which server will retry a recall in case of failures */
+	uint32_t deleg_recall_retry_delay;
+	/** Whether this a pNFS MDS server. Defaults to false */
+	bool pnfs_mds;
+	/** Whether this a pNFS DS server. Defaults to false */
+	bool pnfs_ds;
 } nfs_version4_parameter_t;
 
 /** @} */

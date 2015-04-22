@@ -47,11 +47,9 @@
 #ifndef FSAL_UP_H
 #define FSAL_UP_H
 
-#include "fsal_types.h"
+#include "gsh_status.h"
 #include "fsal_api.h"
 #include "cache_inode.h"
-#include "nfs_exports.h"
-#include "sal_data.h"
 
 /**
  * Empty flags.
@@ -280,7 +278,7 @@ int up_async_delegrecall(struct fridgethr *fr,
 			 void *cb_arg);
 
 /** @} */
-
+int async_delegrecall(struct fridgethr *fr, cache_entry_t *entry);
 cache_inode_status_t fsal_invalidate(struct fsal_module *fsal,
 				     struct gsh_buffdesc *handle,
 				     uint32_t flags);

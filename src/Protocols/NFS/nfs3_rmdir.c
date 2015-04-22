@@ -36,7 +36,7 @@
 #include <sys/file.h>
 #include "hashtable.h"
 #include "log.h"
-#include "ganesha_rpc.h"
+#include "gsh_rpc.h"
 #include "nfs23.h"
 #include "nfs4.h"
 #include "mount.h"
@@ -54,7 +54,6 @@
  * Implements the NFSPROC3_RMDIR function.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  export  NFS export list
  * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call

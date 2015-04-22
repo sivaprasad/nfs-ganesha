@@ -41,6 +41,98 @@ unsigned int reaper_delay = REAPER_DELAY;
 
 static struct fridgethr *reaper_fridge;
 
+static int reap_expired_open_owners(hash_table_t *ht_reap)
+{
+	struct rbt_head *head_rbt;
+	struct hash_data *addr = NULL;
+	uint32_t i;
+	int rc;
+	struct rbt_node *pn;
+	int count = 0;
+	char str[LOG_BUFF_LEN];
+	struct display_buffer dspbuf = {
+			sizeof(str), str, str};
+	state_owner_t *powner;
+	time_t tnow, tclose, texpire;
+	struct gsh_buffdesc buffkey;
+	struct gsh_buffdesc old_value;
+	struct gsh_buffdesc old_key;
+
+	/* For each bucket of the requested hashtable */
+	for (i = 0; i < ht_reap->parameter.index_size; i++) {
+		head_rbt = &ht_reap->partitions[i].rbt;
+
+ restart:
+		/* Use the time at the start or restart of a bucket to
+		 * check for validity (don't call time() too many times).
+		 */
+		tnow = time(NULL);
+
+		/* acquire mutex */
+		PTHREAD_RWLOCK_wrlock(&ht_reap->partitions[i].lock);
+
+		/* go through all entries in the red-black-tree */
+		RBT_LOOP(head_rbt, pn) {
+			addr = RBT_OPAQ(pn);
+
+
+			powner = addr->val.addr;
+			count++;
+
+			if (powner->so_type != STATE_OPEN_OWNER_NFSV4) {
+				RBT_INCREMENT(pn);
+				continue;
+			}
+
+			display_owner(&dspbuf, powner);
+
+			/* Cleanup the open owner only if its refcount is zero
+			 * and its last_close_time exceeds the lease_lifetime
+			 */
+			tclose = atomic_fetch_time_t(&powner->so_owner.
+						     so_nfs4_owner.
+						     last_close_time);
+			texpire = tclose + nfs_param.nfsv4_param.lease_lifetime;
+
+			if ((tclose == 0) || (texpire > tnow)) {
+				if (tclose != 0 &&
+					isFullDebug(COMPONENT_STATE)) {
+					LogFullDebug(COMPONENT_STATE,
+							"Did not release CLOSE_PENDING %s, %d seconds left",
+							str,
+							(int) (texpire - tnow));
+				}
+				RBT_INCREMENT(pn);
+				continue;
+			}
+			LogFullDebug(COMPONENT_STATE, "Free {%s}", str);
+			buffkey.addr = powner;
+			buffkey.len = sizeof(*powner);
+
+			atomic_inc_int32_t(&powner->so_refcount);
+			PTHREAD_RWLOCK_unlock(&ht_reap->partitions[i].
+					      lock);
+			rc = HashTable_Del(ht_reap, &buffkey,
+					   &old_key, &old_value);
+
+			if (rc != HASHTABLE_SUCCESS) {
+				LogCrit(COMPONENT_CLIENTID,
+					"Could not remove expired owner %s"
+					" error=%s", str,
+					hash_table_err_to_str(rc));
+			}
+
+			atomic_dec_int32_t(&powner->so_refcount);
+			free_state_owner(powner);
+			goto restart;
+
+		}
+		PTHREAD_RWLOCK_unlock(&ht_reap->partitions[i].lock);
+	}
+
+	return count;
+}
+
 static int reap_hash_table(hash_table_t *ht_reap)
 {
 	struct rbt_head *head_rbt;
@@ -67,43 +159,59 @@ static int reap_hash_table(hash_table_t *ht_reap)
 			pclientid = addr->val.addr;
 			count++;
 
-			pthread_mutex_lock(&pclientid->cid_mutex);
+			PTHREAD_MUTEX_lock(&pclientid->cid_mutex);
 
 			if (!valid_lease(pclientid)) {
+				char str[LOG_BUFF_LEN];
+				struct display_buffer dspbuf = {
+					sizeof(str), str, str};
+				bool str_valid = false;
+
 				inc_client_id_ref(pclientid);
 
 				/* Take a reference to the client record */
 				precord = pclientid->cid_client_record;
 				inc_client_record_ref(precord);
 
-				pthread_mutex_unlock(&pclientid->cid_mutex);
+				PTHREAD_MUTEX_unlock(&pclientid->cid_mutex);
 
 				PTHREAD_RWLOCK_unlock(&ht_reap->partitions[i].
 						      lock);
 
 				if (isDebug(COMPONENT_CLIENTID)) {
-					char str[HASHTABLE_DISPLAY_STRLEN];
-
-					display_client_id_rec(pclientid, str);
+					display_client_id_rec(&dspbuf,
+							      pclientid);
 
 					LogFullDebug(COMPONENT_CLIENTID,
 						     "Expire index %d %s", i,
 						     str);
+					str_valid = true;
 				}
 
 				/* Take cr_mutex and expire clientid */
-				pthread_mutex_lock(&precord->cr_mutex);
+				PTHREAD_MUTEX_lock(&precord->cr_mutex);
 
-				rc = nfs_client_id_expire(pclientid);
+				rc = nfs_client_id_expire(pclientid, false);
 
-				pthread_mutex_unlock(&precord->cr_mutex);
+				PTHREAD_MUTEX_unlock(&precord->cr_mutex);
 
 				dec_client_id_ref(pclientid);
 				dec_client_record_ref(precord);
+
+				if (isFullDebug(COMPONENT_CLIENTID)) {
+					if (!str_valid)
+						display_printf(&dspbuf,
+							       "clientid %p",
+							       pclientid);
+					LogFullDebug(COMPONENT_CLIENTID,
+						     "Reaper done, expired {%s}",
+						     str);
+				}
+
 				if (rc)
 					goto restart;
 			} else {
-				pthread_mutex_unlock(&pclientid->cid_mutex);
+				PTHREAD_MUTEX_unlock(&pclientid->cid_mutex);
 			}
 
 			RBT_INCREMENT(pn);
@@ -161,6 +269,8 @@ static void reaper_run(struct fridgethr_context *ctx)
 	rst->count =
 	    (reap_hash_table(ht_confirmed_client_id) +
 	     reap_hash_table(ht_unconfirmed_client_id));
+
+	rst->count += reap_expired_open_owners(ht_nfs4_owner);
 }
 
 int reaper_init(void)

@@ -33,8 +33,6 @@
  */
 
 #include "config.h"
-#include "ganesha_rpc.h"
-#include "nfs_core.h"
 #include <unistd.h>		/* for using gethostname */
 #include <stdlib.h>		/* for using exit */
 #include <strings.h>
@@ -46,11 +44,14 @@
 #include <stdbool.h>
 #ifdef USE_NFSIDMAP
 #include <nfsidmap.h>
+#include "nfs_exports.h"
 #endif				/* USE_NFSIDMAP */
 #ifdef _MSPAC_SUPPORT
 #include <wbclient.h>
 #endif
 #include "common_utils.h"
+#include "gsh_rpc.h"
+#include "nfs_core.h"
 #include "idmapper.h"
 
 static struct gsh_buffdesc owner_domain;
@@ -133,14 +134,28 @@ static bool xdr_encode_nfs4_princ(XDR *xdrs, uint32_t id, bool group)
 		PTHREAD_RWLOCK_unlock(group ? &idmapper_group_lock :
 				      &idmapper_user_lock);
 		int rc;
+		int size;
 		bool looked_up = false;
-		char *namebuff =
-		    alloca(nfs_param.nfsv4_param.
-			   use_getpwnam ? (PWENT_MAX_LEN + owner_domain.len +
-					   2) : (NFS4_MAX_DOMAIN_LEN + 2));
-		struct gsh_buffdesc new_name = {
-			.addr = namebuff
-		};
+		char *namebuff = NULL;
+		struct gsh_buffdesc new_name;
+
+		if (nfs_param.nfsv4_param.use_getpwnam) {
+			if (group)
+				size = sysconf(_SC_GETGR_R_SIZE_MAX);
+			else
+				size = sysconf(_SC_GETPW_R_SIZE_MAX);
+			if (size == -1)
+				size = PWENT_BEST_GUESS_LEN;
+			new_name.len = size;
+			size += owner_domain.len + 2;
+		} else {
+			size = NFS4_MAX_DOMAIN_LEN + 2;
+		}
+
+		namebuff = alloca(size);
+
+		new_name.addr = namebuff;
+
 		if (nfs_param.nfsv4_param.use_getpwnam) {
 			char *cursor;
 			bool nulled;
@@ -149,14 +164,14 @@ static bool xdr_encode_nfs4_princ(XDR *xdrs, uint32_t id, bool group)
 				struct group g;
 				struct group *gres;
 
-				rc = getgrgid_r(id, &g, namebuff, PWENT_MAX_LEN,
+				rc = getgrgid_r(id, &g, namebuff, new_name.len,
 						&gres);
 				nulled = (gres == NULL);
 			} else {
 				struct passwd p;
 				struct passwd *pres;
 
-				rc = getpwuid_r(id, &p, namebuff, PWENT_MAX_LEN,
+				rc = getpwuid_r(id, &p, namebuff, new_name.len,
 						&pres);
 				nulled = (pres == NULL);
 			}
@@ -171,7 +186,7 @@ static bool xdr_encode_nfs4_princ(XDR *xdrs, uint32_t id, bool group)
 				new_name.len += owner_domain.len;
 				looked_up = true;
 			} else {
-				LogWarn(COMPONENT_IDMAPPER,
+				LogInfo(COMPONENT_IDMAPPER,
 					"%s failed with code %d.",
 					(group ? "getgrgid_r" : "getpwuid_r"),
 					rc);
@@ -191,10 +206,10 @@ static bool xdr_encode_nfs4_princ(XDR *xdrs, uint32_t id, bool group)
 				new_name.len = strlen(namebuff);
 				looked_up = true;
 			} else {
-				LogWarn(COMPONENT_IDMAPPER,
+				LogInfo(COMPONENT_IDMAPPER,
 					"%s failed with code %d.",
 					(group ? "nfs4_gid_to_name" :
-					 "nfs4_uid_to_name"), rc);
+					"nfs4_uid_to_name"), rc);
 			}
 #else				/* USE_NFSIDMAP */
 			looked_up = false;
@@ -203,15 +218,15 @@ static bool xdr_encode_nfs4_princ(XDR *xdrs, uint32_t id, bool group)
 
 		if (!looked_up) {
 			if (nfs_param.nfsv4_param.allow_numeric_owners) {
-				LogWarn(COMPONENT_IDMAPPER,
+				LogInfo(COMPONENT_IDMAPPER,
 					"Lookup for %d failed, "
 					"using numeric %s", id,
 					(group ? "group" : "owner"));
-				/* 2³² is 10 digits long in decimal */
+				/* 2**32 is 10 digits long in decimal */
 				sprintf(namebuff, "%u", id);
 				new_name.len = strlen(namebuff);
 			} else {
-				LogWarn(COMPONENT_IDMAPPER,
+				LogInfo(COMPONENT_IDMAPPER,
 					"Lookup for %d failed, using nobody.",
 					id);
 				memcpy(new_name.addr, "nobody", 6);
@@ -299,6 +314,67 @@ static bool atless2id(char *name, size_t len, uint32_t *id,
 }
 
 /**
+ * @brief Return gid given a group name
+ *
+ * @param[in]  name  group name
+ * @param[out] gid   address for gid to be filled in
+ *
+ * @return 0 on success and errno on failure.
+ *
+ * NOTE: If a group name doesn't exist, getgrnam_r returns 0 with the
+ * result pointer set to NULL. We turn that into ENOENT error! Also,
+ * getgrnam_r fails with ERANGE if there is a group with a large number
+ * of users that it can't fill all those users into the supplied buffer.
+ * This need not be the group we are asking for! ERANGE is handled here,
+ * so this function never ends up returning ERANGE back to the caller.
+ */
+static int name_to_gid(const char *name, gid_t *gid)
+{
+	struct group g;
+	struct group *gres = NULL;
+	char *buf;
+	size_t buflen = sysconf(_SC_GETGR_R_SIZE_MAX);
+
+	/* Upper bound on the buffer length. Just to bailout if there is
+	 * a bug in getgrname_r returning ERANGE incorrectly. 64MB
+	 * should be good enough for now.
+	 */
+	size_t maxlen = 64 * 1024 * 1024;
+	int err;
+
+	if (buflen == -1)
+		buflen = PWENT_BEST_GUESS_LEN;
+
+	do {
+		buf = gsh_malloc(buflen);
+		if (buf == NULL) {
+			LogCrit(COMPONENT_IDMAPPER,
+				"gsh_malloc failed, buflen: %zu", buflen);
+
+			return ENOMEM;
+		}
+
+		err = getgrnam_r(name, &g, buf, buflen, &gres);
+		if (err == ERANGE) {
+			buflen *= 16;
+			gsh_free(buf);
+		}
+	} while (buflen <= maxlen && err == ERANGE);
+
+	if (err == 0) {
+		if (gres == NULL)
+			err = ENOENT;
+		else
+			*gid = gres->gr_gid;
+	}
+
+	if (err != ERANGE)
+		gsh_free(buf);
+
+	return err;
+}
+
+/**
  * @brief Lookup a name using PAM
  *
  * @param[in]  name       C string of name
@@ -325,17 +401,15 @@ static bool pwentname2id(char *name, size_t len, uint32_t *id,
 		*at = '\0';
 	}
 	if (group) {
-		struct group g;
-		struct group *gres;
-		char *gbuf = alloca(PWENT_MAX_LEN);
+		int err;
 
-		if (getgrnam_r(name, &g, gbuf, PWENT_MAX_LEN, &gres) != 0) {
-			LogMajor(COMPONENT_IDMAPPER, "getpwnam_r %s failed",
-				 name);
-			return false;
-		} else if (gres != NULL) {
-			*id = gres->gr_gid;
+		err = name_to_gid(name, id);
+		if (err == 0)
 			return true;
+		else if (err != ENOENT) {
+			LogWarn(COMPONENT_IDMAPPER,
+				"getgrnam_r %s failed, error: %d", name, err);
+			return false;
 		}
 #ifndef USE_NFSIDMAP
 		else {
@@ -353,9 +427,15 @@ static bool pwentname2id(char *name, size_t len, uint32_t *id,
 	} else {
 		struct passwd p;
 		struct passwd *pres;
-		char *buf = alloca(PWENT_MAX_LEN);
+		int size = sysconf(_SC_GETPW_R_SIZE_MAX);
+		char *buf;
 
-		if (getpwnam_r(name, &p, buf, PWENT_MAX_LEN, &pres) != 0) {
+		if (size == -1)
+			size = PWENT_BEST_GUESS_LEN;
+
+		buf = alloca(size);
+
+		if (getpwnam_r(name, &p, buf, size, &pres) != 0) {
 			LogInfo(COMPONENT_IDMAPPER, "getpwnam_r %s failed",
 				name);
 			return false;

@@ -31,9 +31,12 @@
  * A set of functions used to managed NFS.
  */
 #include "log.h"
+#include "fsal.h"
 #include "cache_inode.h"
 #include "fsal_convert.h"
+#include "nfs_core.h"
 #include "nfs_convert.h"
+#include "nfs_exports.h"
 #include "nfs_proto_tools.h"
 #include "idmapper.h"
 #include "export_mgr.h"
@@ -205,15 +208,13 @@ bool nfs_RetryableError(cache_inode_status_t cache_status)
 	case CACHE_INODE_FSAL_EPERM:
 	case CACHE_INODE_NO_SPACE_LEFT:
 	case CACHE_INODE_READ_ONLY_FS:
-	case CACHE_INODE_KILLED:
-	case CACHE_INODE_FSAL_ESTALE:
+	case CACHE_INODE_ESTALE:
 	case CACHE_INODE_FSAL_ERR_SEC:
 	case CACHE_INODE_QUOTA_EXCEEDED:
 	case CACHE_INODE_NOT_SUPPORTED:
 	case CACHE_INODE_UNION_NOTSUPP:
 	case CACHE_INODE_NAME_TOO_LONG:
 	case CACHE_INODE_STATE_CONFLICT:
-	case CACHE_INODE_DEAD_ENTRY:
 	case CACHE_INODE_ASYNC_POST_ERROR:
 	case CACHE_INODE_STATE_ERROR:
 	case CACHE_INODE_BAD_COOKIE:
@@ -239,6 +240,40 @@ bool nfs_RetryableError(cache_inode_status_t cache_status)
 		 cache_status, __LINE__);
 	return false;
 }
+/**
+ * @brief Returns the maximun attribute index possbile for a 4.x protocol.
+ *
+ * This function returns the maximun attribute index possbile for a
+ * 4.x protocol.
+ * returns -1 if the protocol is not recognized.
+ *
+ * @param minorversion[IN] input minorversion of the protocol.
+ *
+ * @return the max index possbile for the minorversion, -1 if minorversion is
+ * not recognized.
+ *
+ */
+
+static inline int nfs4_max_attr_index(compound_data_t *data)
+{
+	if (data) {
+		enum nfs4_minor_vers minorversion = data->minorversion;
+		switch (minorversion) {
+		case NFS4_MINOR_VERS_0:
+			return FATTR4_MOUNTED_ON_FILEID;
+		case NFS4_MINOR_VERS_1:
+			return FATTR4_FS_CHARSET_CAP;
+		case NFS4_MINOR_VERS_2:
+			return FATTR4_SEC_LABEL;
+		}
+	} else {
+		return FATTR4_SEC_LABEL;
+	}
+	/* Should never be here */
+	LogFatal(COMPONENT_NFS_V4, "Unexpected minor version for NFSv4");
+	return -1;
+}
+
 
 /* NFSv4.0+ Attribute management
  * XDR encode/decode/compare functions for FSAL <-> Fattr4 translations
@@ -261,9 +296,12 @@ static fattr_xdr_result encode_supported_attrs(XDR *xdr,
 {
 	struct bitmap4 bits;
 	int attr, offset;
+	int max_attr_idx;
 
 	memset(&bits, 0, sizeof(bits));
-	for (attr = FATTR4_SUPPORTED_ATTRS; attr <= FATTR4_CHANGE_SEC_LABEL;
+	max_attr_idx = nfs4_max_attr_index(args->data);
+
+	for (attr = FATTR4_SUPPORTED_ATTRS; attr <= max_attr_idx;
 	     attr++) {
 		if (fattr4tab[attr].supported) {
 			bool res = set_attribute_in_bitmap(&bits, attr);
@@ -435,7 +473,7 @@ static fattr_xdr_result encode_linksupport(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		linksupport =
-		    export->ops->fs_supports(export, fso_link_support);
+		    export->exp_ops.fs_supports(export, fso_link_support);
 	}
 	if (!xdr_bool(xdr, &linksupport))
 		return FATTR_XDR_FAILED;
@@ -461,7 +499,7 @@ static fattr_xdr_result encode_symlinksupport(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		symlinksupport =
-		    export->ops->fs_supports(export, fso_symlink_support);
+		    export->exp_ops.fs_supports(export, fso_symlink_support);
 	}
 	if (!xdr_bool(xdr, &symlinksupport))
 		return FATTR_XDR_FAILED;
@@ -489,7 +527,7 @@ static fattr_xdr_result encode_namedattrsupport(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		namedattrsupport =
-		    export->ops->fs_supports(export, fso_named_attr);
+		    export->exp_ops.fs_supports(export, fso_named_attr);
 	}
 	if (!xdr_bool(xdr, &namedattrsupport))
 		return FATTR_XDR_FAILED;
@@ -549,7 +587,7 @@ static fattr_xdr_result encode_uniquehandles(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		uniquehandles =
-		    export->ops->fs_supports(export, fso_unique_handles);
+		    export->exp_ops.fs_supports(export, fso_unique_handles);
 	}
 	if (!inline_xdr_bool(xdr, &uniquehandles))
 		return FATTR_XDR_FAILED;
@@ -798,7 +836,7 @@ static fattr_xdr_result encode_aclsupport(XDR *xdr,
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		aclsupport = export->ops->fs_acl_support(export);
+		aclsupport = export->exp_ops.fs_acl_support(export);
 	}
 	if (!inline_xdr_u_int32_t(xdr, &aclsupport))
 		return FATTR_XDR_FAILED;
@@ -844,7 +882,8 @@ static fattr_xdr_result encode_cansettime(XDR *xdr,
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		cansettime = export->ops->fs_supports(export, fso_cansettime);
+		cansettime = export->exp_ops.
+				fs_supports(export, fso_cansettime);
 	}
 	if (!inline_xdr_bool(xdr, &cansettime))
 		return FATTR_XDR_FAILED;
@@ -871,7 +910,7 @@ static fattr_xdr_result encode_case_insensitive(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		caseinsensitive =
-		    export->ops->fs_supports(export, fso_case_insensitive);
+		    export->exp_ops.fs_supports(export, fso_case_insensitive);
 	}
 	if (!inline_xdr_bool(xdr, &caseinsensitive))
 		return FATTR_XDR_FAILED;
@@ -898,7 +937,7 @@ static fattr_xdr_result encode_case_preserving(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		casepreserving =
-		    export->ops->fs_supports(export, fso_case_preserving);
+		    export->exp_ops.fs_supports(export, fso_case_preserving);
 	}
 	if (!inline_xdr_bool(xdr, &casepreserving))
 		return FATTR_XDR_FAILED;
@@ -925,7 +964,7 @@ static fattr_xdr_result encode_chown_restricted(XDR *xdr,
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
 		chownrestricted =
-		    export->ops->fs_supports(export, fso_chown_restricted);
+		    export->exp_ops.fs_supports(export, fso_chown_restricted);
 	}
 	if (!inline_xdr_bool(xdr, &chownrestricted))
 		return FATTR_XDR_FAILED;
@@ -946,8 +985,16 @@ static fattr_xdr_result decode_chown_restricted(XDR *xdr,
 static fattr_xdr_result encode_filehandle(XDR *xdr,
 					  struct xdr_attrs_args *args)
 {
+	file_handle_v4_t *fh;
+
 	if (args->hdl4 == NULL || args->hdl4->nfs_fh4_val == NULL)
 		return FATTR_XDR_FAILED;
+
+	if (args->hdl4->nfs_fh4_len >= sizeof(file_handle_v4_t)) {
+		fh = (file_handle_v4_t *)args->hdl4->nfs_fh4_val;
+		fh->id.exports = htons(fh->id.exports);
+	}
+
 	if (!inline_xdr_bytes
 	    (xdr, &args->hdl4->nfs_fh4_val, &args->hdl4->nfs_fh4_len,
 	     NFS4_FHSIZE))
@@ -960,6 +1007,7 @@ static fattr_xdr_result encode_filehandle(XDR *xdr,
 static fattr_xdr_result decode_filehandle(XDR *xdr,
 					  struct xdr_attrs_args *args)
 {
+	file_handle_v4_t *fh;
 	uint32_t fhlen = 0, pos;
 
 	if (args->hdl4 == NULL || args->hdl4->nfs_fh4_val == NULL) {
@@ -973,7 +1021,10 @@ static fattr_xdr_result decode_filehandle(XDR *xdr,
 		    (xdr, &args->hdl4->nfs_fh4_val, &args->hdl4->nfs_fh4_len,
 		     NFS4_FHSIZE))
 			return FATTR_XDR_FAILED;
+		fh = (file_handle_v4_t *)args->hdl4->nfs_fh4_val;
+		fh->id.exports = ntohs(fh->id.exports);
 	}
+
 	return FATTR_XDR_SUCCESS;
 }
 
@@ -1102,23 +1153,50 @@ static fattr_xdr_result decode_files_total(XDR *xdr,
 static fattr_xdr_result encode_fs_locations(XDR *xdr,
 					    struct xdr_attrs_args *args)
 {
-/** todo the parse part should be done at export time to a simple struct
- *  the parse is memory and memcpy hungry! NOOP it for now.
- */
-/* if(data->current_entry->type != DIRECTORY) */
-/*   { */
-/*  continue; */
-/*   } */
+	fsal_status_t st;
+	fs_locations4 fs_locs;
+	fs_location4 fs_loc;
+	component4 fs_path;
+	component4 fs_root;
+	component4 fs_server;
+	char root[MNTNAMLEN];
+	char path[MNTNAMLEN];
+	char server[MNTNAMLEN];
 
-/* if(!nfs4_referral_str_To_Fattr_fs_location */
-/*    (data->current_entry->object.dir.referral, tmp_buff, &tmp_int)) */
-/*   { */
-/*  continue; */
-/*   } */
+	if (args->data == NULL || args->data->current_entry == NULL)
+		return FATTR_XDR_NOOP;
 
-/* memcpy((char *)(current_pos), tmp_buff, tmp_int); */
-/* LastOffset += tmp_int; */
-/* break; */
+	if (args->data->current_entry->type != DIRECTORY)
+		return FATTR_XDR_NOOP;
+
+	fs_root.utf8string_len = MNTNAMLEN;
+	fs_root.utf8string_val = root;
+	fs_path.utf8string_len = MNTNAMLEN;
+	fs_path.utf8string_val = path;
+	fs_locs.fs_root.pathname4_len = 1;
+	fs_locs.fs_root.pathname4_val = &fs_path;
+	fs_server.utf8string_len = MNTNAMLEN;
+	fs_server.utf8string_val = server;
+	fs_loc.server.server_len = 1;
+	fs_loc.server.server_val = &fs_server;
+	fs_loc.rootpath.pathname4_len = 1;
+	fs_loc.rootpath.pathname4_val = &fs_root;
+	fs_locs.locations.locations_len = 1;
+	fs_locs.locations.locations_val = &fs_loc;
+
+	/* For now allow for one fs locations, fs_locations() should set:
+	   root and update its length, can not be bigger than MNTNAMLEN
+	   path and update its length, can not be bigger than MNTNAMLEN
+	   server and update its length, can not be bigger than MNTNAMELEN
+	*/
+	st = args->data->current_entry->obj_handle->obj_ops.fs_locations(
+					args->data->current_entry->obj_handle,
+					&fs_locs);
+	if (FSAL_IS_ERROR(st))
+		return FATTR_XDR_NOOP;
+
+	if (!xdr_fs_locations4(xdr, &fs_locs))
+		return FATTR_XDR_FAILED;
 
 	return FATTR_XDR_SUCCESS;
 }
@@ -1162,7 +1240,8 @@ static fattr_xdr_result encode_homogeneous(XDR *xdr,
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		homogeneous = export->ops->fs_supports(export, fso_homogenous);
+		homogeneous = export->exp_ops.
+				fs_supports(export, fso_homogenous);
 	}
 	if (!inline_xdr_bool(xdr, &homogeneous))
 		return FATTR_XDR_FAILED;
@@ -1187,7 +1266,7 @@ static fattr_xdr_result encode_maxfilesize(XDR *xdr,
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		maxfilesize = export->ops->fs_maxfilesize(export);
+		maxfilesize = export->exp_ops.fs_maxfilesize(export);
 	}
 	if (!inline_xdr_u_int64_t(xdr, &maxfilesize))
 		return FATTR_XDR_FAILED;
@@ -1211,7 +1290,7 @@ static fattr_xdr_result encode_maxlink(XDR *xdr, struct xdr_attrs_args *args)
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		maxlink = export->ops->fs_maxlink(export);
+		maxlink = export->exp_ops.fs_maxlink(export);
 	}
 	if (!inline_xdr_u_int32_t(xdr, &maxlink))
 		return FATTR_XDR_FAILED;
@@ -1234,7 +1313,7 @@ static fattr_xdr_result encode_maxname(XDR *xdr, struct xdr_attrs_args *args)
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		maxname = export->ops->fs_maxnamelen(export);
+		maxname = export->exp_ops.fs_maxnamelen(export);
 	}
 	if (!inline_xdr_u_int32_t(xdr, &maxname))
 		return FATTR_XDR_FAILED;
@@ -1343,7 +1422,7 @@ static fattr_xdr_result encode_no_trunc(XDR *xdr, struct xdr_attrs_args *args)
 
 	if (args->data != NULL) {
 		export = op_ctx->fsal_export;
-		no_trunc = export->ops->fs_supports(export, fso_no_trunc);
+		no_trunc = export->exp_ops.fs_supports(export, fso_no_trunc);
 	}
 	if (!inline_xdr_bool(xdr, &no_trunc))
 		return FATTR_XDR_FAILED;
@@ -1538,7 +1617,9 @@ static fattr_xdr_result encode_rawdev(XDR *xdr, struct xdr_attrs_args *args)
 	specdata4.specdata1 = args->attrs->rawdev.major;
 	specdata4.specdata2 = args->attrs->rawdev.minor;
 
-	if (!inline_xdr_u_int64_t(xdr, (uint64_t *) &specdata4))
+	if (!inline_xdr_u_int32_t(xdr, &specdata4.specdata1))
+		return FATTR_XDR_FAILED;
+	if (!inline_xdr_u_int32_t(xdr, &specdata4.specdata2))
 		return FATTR_XDR_FAILED;
 
 	return FATTR_XDR_SUCCESS;
@@ -1548,7 +1629,9 @@ static fattr_xdr_result decode_rawdev(XDR *xdr, struct xdr_attrs_args *args)
 {
 	struct specdata4 specdata4 = {.specdata1 = 0, .specdata2 = 0 };
 
-	if (!inline_xdr_u_int64_t(xdr, (uint64_t *) &specdata4))
+	if (!inline_xdr_u_int32_t(xdr, &specdata4.specdata1))
+		return FATTR_XDR_FAILED;
+	if (!inline_xdr_u_int32_t(xdr, &specdata4.specdata2))
 		return FATTR_XDR_FAILED;
 
 	args->attrs->rawdev.major = specdata4.specdata1;
@@ -2017,7 +2100,7 @@ static fattr_xdr_result encode_fs_layout_types(XDR *xdr,
 	if (args->data == NULL)
 		return FATTR_XDR_NOOP;
 	export = op_ctx->fsal_export;
-	export->ops->fs_layouttypes(export, &typecount, &layouttypes);
+	export->exp_ops.fs_layouttypes(export, &typecount, &layouttypes);
 
 	if (!inline_xdr_u_int32_t(xdr, (uint32_t *) &typecount))
 		return FATTR_XDR_FAILED;
@@ -2081,7 +2164,8 @@ static fattr_xdr_result encode_layout_blocksize(XDR *xdr,
 		return FATTR_XDR_NOOP;
 	} else {
 		struct fsal_export *export = op_ctx->fsal_export;
-		uint32_t blocksize = export->ops->fs_layout_blocksize(export);
+		uint32_t blocksize = export->exp_ops.
+					fs_layout_blocksize(export);
 
 		if (!inline_xdr_u_int32_t(xdr, &blocksize))
 			return FATTR_XDR_FAILED;
@@ -2251,7 +2335,7 @@ static fattr_xdr_result encode_support_exclusive_create(XDR *xdr,
 	int attr, offset;
 
 	memset(&bits, 0, sizeof(bits));
-	for (attr = FATTR4_SUPPORTED_ATTRS; attr <= FATTR4_CHANGE_SEC_LABEL;
+	for (attr = FATTR4_SUPPORTED_ATTRS; attr <= FATTR4_SEC_LABEL;
 	     attr++) {
 		if (fattr4tab[attr].supported) {
 			bool res = set_attribute_in_bitmap(&bits, attr);
@@ -2299,7 +2383,7 @@ static fattr_xdr_result decode_fs_charset_cap(XDR *xdr,
  * indexed by attribute number
  */
 
-const struct fattr4_dent fattr4tab[FATTR4_CHANGE_SEC_LABEL + 1] = {
+const struct fattr4_dent fattr4tab[FATTR4_SEC_LABEL + 1] = {
 	[FATTR4_SUPPORTED_ATTRS] = {
 		.name = "FATTR4_SUPPORTED_ATTRS",
 		.supported = 1,
@@ -2500,7 +2584,7 @@ const struct fattr4_dent fattr4tab[FATTR4_CHANGE_SEC_LABEL + 1] = {
 	,
 	[FATTR4_FS_LOCATIONS] = {
 		.name = "FATTR4_FS_LOCATIONS",
-		.supported = 0,
+		.supported = 1,
 		.size_fattr4 = sizeof(fattr4_fs_locations),
 		.encode = encode_fs_locations,
 		.decode = decode_fs_locations,
@@ -2941,15 +3025,6 @@ const struct fattr4_dent fattr4tab[FATTR4_CHANGE_SEC_LABEL + 1] = {
 		.encode = encode_fs_charset_cap,
 		.decode = decode_fs_charset_cap,
 		.access = FATTR4_ATTR_READ}
-	,
-	[FATTR4_SPACE_RESERVED] = {
-		.name = "FATTR4_SPACE_RESERVED",
-		.supported = 1,
-		.size_fattr4 = sizeof(fattr4_size),
-		.attrmask = ATTR4_SPACE_RESERVED,
-		.encode = encode_filesize,
-		.decode = decode_filesize,
-		.access = FATTR4_ATTR_READ_WRITE}
 };
 
 /* goes in a more global header?
@@ -3080,7 +3155,8 @@ struct Fattr_filler_opaque {
 static cache_inode_status_t Fattr_filler(void *opaque,
 					 cache_entry_t *entry,
 					 const struct attrlist *attr,
-					 uint64_t mounted_on_fileid)
+					 uint64_t mounted_on_fileid,
+					 enum cb_state cb_state)
 {
 	struct xdr_attrs_args args;
 	struct Fattr_filler_opaque *f = (struct Fattr_filler_opaque *)opaque;
@@ -3151,8 +3227,8 @@ nfsstat4 cache_entry_To_Fattr(cache_entry_t *entry, fattr4 *Fattr,
 			 "No permission check for ACL for entry %p", entry);
 	}
 
-	return
-	    nfs4_Errno(cache_inode_getattr(entry, &f, Fattr_filler));
+	return nfs4_Errno(
+		cache_inode_getattr(entry, &f, Fattr_filler, CB_ORIGINAL));
 }
 
 int nfs4_Fattr_Fill_Error(fattr4 *Fattr, nfsstat4 rdattr_error)
@@ -3232,6 +3308,7 @@ int nfs4_FSALattr_To_Fattr(struct xdr_attrs_args *args, struct bitmap4 *Bitmap,
 			   fattr4 *Fattr)
 {
 	int attribute_to_set = 0;
+	int max_attr_idx;
 	u_int LastOffset;
 	fsal_dynamicfsinfo_t dynamicinfo;
 	XDR attr_body;
@@ -3248,6 +3325,9 @@ int nfs4_FSALattr_To_Fattr(struct xdr_attrs_args *args, struct bitmap4 *Bitmap,
 	if (Fattr->attr_vals.attrlist4_val == NULL)
 		return -1;
 
+	max_attr_idx = nfs4_max_attr_index(args->data);
+	LogFullDebug(COMPONENT_NFS_V4, "Maximum allowed attr index = %d",
+		 max_attr_idx);
 
 	LastOffset = 0;
 	memset(&attr_body, 0, sizeof(attr_body));
@@ -3261,7 +3341,7 @@ int nfs4_FSALattr_To_Fattr(struct xdr_attrs_args *args, struct bitmap4 *Bitmap,
 	     attribute_to_set != -1;
 	     attribute_to_set =
 	     next_attr_from_bitmap(Bitmap, attribute_to_set)) {
-		if (attribute_to_set > FATTR4_CHANGE_SEC_LABEL)
+		if (attribute_to_set > max_attr_idx)
 			break;	/* skip out of bounds */
 
 		xdr_res = fattr4tab[attribute_to_set].encode(&attr_body, args);
@@ -3641,7 +3721,7 @@ bool nfs4_Fattr_Check_Access_Bitmap(struct bitmap4 *bitmap, int access)
 
 	for (attribute = next_attr_from_bitmap(bitmap, -1); attribute != -1;
 	     attribute = next_attr_from_bitmap(bitmap, attribute)) {
-		if (attribute > FATTR4_CHANGE_SEC_LABEL) {
+		if (attribute > FATTR4_SEC_LABEL) {
 			/* Erroneous value... skip */
 			continue;
 		}
@@ -3683,7 +3763,7 @@ void nfs4_bitmap4_Remove_Unsupported(struct bitmap4 *bitmap)
 {
 	int attribute;
 
-	for (attribute = 0; attribute <= FATTR4_CHANGE_SEC_LABEL; attribute++) {
+	for (attribute = 0; attribute <= FATTR4_SEC_LABEL; attribute++) {
 		if (!fattr4tab[attribute].supported) {
 			if (!clear_attribute_in_bitmap(bitmap, attribute))
 				break;
@@ -3776,7 +3856,7 @@ int nfs4_Fattr_cmp(fattr4 *Fattr1, fattr4 *Fattr2)
 	     attribute_to_set != -1;
 	     attribute_to_set =
 	     next_attr_from_bitmap(&Fattr1->attrmask, attribute_to_set)) {
-		if (attribute_to_set > FATTR4_CHANGE_SEC_LABEL) {
+		if (attribute_to_set > FATTR4_SEC_LABEL) {
 			/* Erroneous value... skip */
 			continue;
 		}
@@ -3838,7 +3918,6 @@ int nfs4_Fattr_cmp(fattr4 *Fattr1, fattr4 *Fattr2)
 		case FATTR4_FH_EXPIRE_TYPE:
 		case FATTR4_CHANGE:
 		case FATTR4_SIZE:
-		case FATTR4_SPACE_RESERVED:
 		case FATTR4_LINK_SUPPORT:
 		case FATTR4_SYMLINK_SUPPORT:
 		case FATTR4_NAMED_ATTR:
@@ -3957,7 +4036,7 @@ static int Fattr4_To_FSAL_attr(struct attrlist *attrs, fattr4 *Fattr,
 	     next_attr_from_bitmap(&Fattr->attrmask, attribute_to_set)) {
 		const struct fattr4_dent *f4e = fattr4tab + attribute_to_set;
 
-		if (attribute_to_set > FATTR4_CHANGE_SEC_LABEL) {
+		if (attribute_to_set > FATTR4_SEC_LABEL) {
 			nfs_status = NFS4ERR_BADXDR;	/* undefined attr */
 			break;
 		}
@@ -4056,7 +4135,8 @@ nfsstat4 nfs4_utf8string2dynamic(const utf8string *input,
 	if (input->utf8string_val == NULL || input->utf8string_len == 0)
 		return NFS4ERR_INVAL;
 
-	if (input->utf8string_len > MAXNAMLEN)
+	if ((scan == UTF8_SCAN_SYMLINK && input->utf8string_len > MAXPATHLEN) ||
+	    (scan != UTF8_SCAN_SYMLINK && input->utf8string_len > MAXNAMLEN))
 		return NFS4ERR_NAMETOOLONG;
 
 	char *name = gsh_malloc(input->utf8string_len + 1);
@@ -4073,4 +4153,20 @@ nfsstat4 nfs4_utf8string2dynamic(const utf8string *input,
 	else
 		gsh_free(name);
 	return status;
+}
+
+/**
+ * @brief: is a directory's sticky bit set?
+ *
+ */
+bool is_sticky_bit_set(const struct attrlist *attr)
+{
+	if (attr->mode & (S_IXUSR|S_IXGRP|S_IXOTH))
+		return false;
+
+	if (!(attr->mode & S_ISVTX))
+		return false;
+
+	LogDebug(COMPONENT_NFS_V4, "sticky bit is set on %ld", attr->fileid);
+	return true;
 }

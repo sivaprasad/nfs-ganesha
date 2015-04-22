@@ -33,7 +33,7 @@ set( uid2grp_SRCS
      uid2grp_cache.c
 )
 
-add_library( uid2grp ${uid2grp_SRCS} )
+add_library( uid2grp STATIC ${uid2grp_SRCS} )
 
 ########### next target ###############
 
@@ -44,6 +44,7 @@ SET(support_STAT_SRCS
    nfs_read_conf.c
    nfs_convert.c
    nfs_ip_name.c
+   ds.c
    exports.c
    fridgethr.c
    delayed_exec.c

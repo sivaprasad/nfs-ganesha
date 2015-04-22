@@ -32,17 +32,18 @@
 
 #include "config.h"
 
-#include "fsal.h"
-#include "fsal_handle_syscalls.h"
 #include <libgen.h>		/* used for 'dirname' */
 #include <pthread.h>
 #include <string.h>
 #include <sys/types.h>
-#include "ganesha_list.h"
+#include "gsh_list.h"
+#include "fsal.h"
 #include "fsal_convert.h"
+#include "fsal_handle_syscalls.h"
 #include "FSAL/fsal_commonlib.h"
 #include "vfs_methods.h"
 #include <os/subr.h>
+#include "subfsal.h"
 
 /* helpers
  */
@@ -68,6 +69,8 @@ static struct vfs_fsal_obj_handle *alloc_handle(int dirfd,
 						const char *path,
 						struct fsal_export *exp_hdl)
 {
+	struct vfs_fsal_export *myself =
+	    container_of(exp_hdl, struct vfs_fsal_export, export);
 	struct vfs_fsal_obj_handle *hdl;
 	fsal_status_t st;
 
@@ -122,13 +125,16 @@ static struct vfs_fsal_obj_handle *alloc_handle(int dirfd,
 			goto spcerr;
 	}
 	hdl->obj_handle.attributes.mask =
-	    exp_hdl->ops->fs_supported_attrs(exp_hdl);
+	    exp_hdl->exp_ops.fs_supported_attrs(exp_hdl);
 	st = posix2fsal_attributes(stat, &hdl->obj_handle.attributes);
 	if (FSAL_IS_ERROR(st))
 		goto spcerr;
 	hdl->obj_handle.attributes.fsid = fs->fsid;
 	fsal_obj_handle_init(&hdl->obj_handle, exp_hdl,
 			     posix2fsal_type(stat->st_mode));
+	vfs_handle_ops_init(&hdl->obj_handle.obj_ops);
+	vfs_sub_init_handle_ops(myself, &hdl->obj_handle.obj_ops);
+
 	return hdl;
 
  spcerr:
@@ -168,7 +174,7 @@ static fsal_status_t lookup(struct fsal_obj_handle *parent,
 	*handle = NULL;		/* poison it first */
 	parent_hdl =
 	    container_of(parent, struct vfs_fsal_obj_handle, obj_handle);
-	if (!parent->ops->handle_is(parent, DIRECTORY)) {
+	if (!parent->obj_ops.handle_is(parent, DIRECTORY)) {
 		LogCrit(COMPONENT_FSAL,
 			"Parent handle is not a directory. hdl = 0x%p", parent);
 		return fsalstat(ERR_FSAL_NOTDIR, 0);
@@ -356,7 +362,7 @@ static fsal_status_t create(struct fsal_obj_handle *dir_hdl,
 
 	*handle = NULL;		/* poison it */
 
-	if (!dir_hdl->ops->handle_is(dir_hdl, DIRECTORY)) {
+	if (!dir_hdl->obj_ops.handle_is(dir_hdl, DIRECTORY)) {
 		LogCrit(COMPONENT_FSAL,
 			"Parent handle is not a directory. hdl = 0x%p",
 			dir_hdl);
@@ -374,7 +380,7 @@ static fsal_status_t create(struct fsal_obj_handle *dir_hdl,
 		goto hdlerr;
 	}
 	unix_mode = fsal2unix_mode(attrib->mode)
-	    & ~op_ctx->fsal_export->ops->fs_umask(op_ctx->fsal_export);
+	    & ~op_ctx->fsal_export->exp_ops.fs_umask(op_ctx->fsal_export);
 	dir_fd = vfs_fsal_open(myself, flags, &fsal_error);
 	if (dir_fd < 0)
 		return fsalstat(fsal_error, -dir_fd);
@@ -443,7 +449,7 @@ static fsal_status_t makedir(struct fsal_obj_handle *dir_hdl,
 	LogDebug(COMPONENT_FSAL, "create %s", name);
 
 	*handle = NULL;		/* poison it */
-	if (!dir_hdl->ops->handle_is(dir_hdl, DIRECTORY)) {
+	if (!dir_hdl->obj_ops.handle_is(dir_hdl, DIRECTORY)) {
 		LogCrit(COMPONENT_FSAL,
 			"Parent handle is not a directory. hdl = 0x%p",
 			dir_hdl);
@@ -461,7 +467,7 @@ static fsal_status_t makedir(struct fsal_obj_handle *dir_hdl,
 		goto hdlerr;
 	}
 	unix_mode = fsal2unix_mode(attrib->mode)
-	    & ~op_ctx->fsal_export->ops->fs_umask(op_ctx->fsal_export);
+	    & ~op_ctx->fsal_export->exp_ops.fs_umask(op_ctx->fsal_export);
 	dir_fd = vfs_fsal_open(myself, flags, &fsal_error);
 	if (dir_fd < 0)
 		return fsalstat(fsal_error, -dir_fd);
@@ -536,7 +542,7 @@ static fsal_status_t makenode(struct fsal_obj_handle *dir_hdl,
 	LogDebug(COMPONENT_FSAL, "create %s", name);
 
 	*handle = NULL;		/* poison it */
-	if (!dir_hdl->ops->handle_is(dir_hdl, DIRECTORY)) {
+	if (!dir_hdl->obj_ops.handle_is(dir_hdl, DIRECTORY)) {
 		LogCrit(COMPONENT_FSAL,
 			"Parent handle is not a directory. hdl = 0x%p",
 			dir_hdl);
@@ -557,7 +563,7 @@ static fsal_status_t makenode(struct fsal_obj_handle *dir_hdl,
 	user = attrib->owner;
 	group = attrib->group;
 	unix_mode = fsal2unix_mode(attrib->mode)
-	    & ~op_ctx->fsal_export->ops->fs_umask(op_ctx->fsal_export);
+	    & ~op_ctx->fsal_export->exp_ops.fs_umask(op_ctx->fsal_export);
 	switch (nodetype) {
 	case BLOCK_FILE:
 		create_mode = S_IFBLK;
@@ -591,11 +597,14 @@ static fsal_status_t makenode(struct fsal_obj_handle *dir_hdl,
 		group = -1;  /*setgid bit on dir propagates dir group owner */
 
 	/* create it with no access because we are root when we do this */
+	fsal_set_credentials(op_ctx->creds);
 	retval = mknodat(dir_fd, name, create_mode, unix_dev);
 	if (retval < 0) {
 		retval = errno;
+		fsal_restore_ganesha_credentials();
 		goto direrr;
 	}
+	fsal_restore_ganesha_credentials();
 	retval = make_file_safe(myself, op_ctx, dir_fd, name,
 				unix_mode, user, group, &hdl);
 	if (!retval) {
@@ -638,7 +647,7 @@ static fsal_status_t makesymlink(struct fsal_obj_handle *dir_hdl,
 	LogDebug(COMPONENT_FSAL, "create %s", name);
 
 	*handle = NULL;		/* poison it first */
-	if (!dir_hdl->ops->handle_is(dir_hdl, DIRECTORY)) {
+	if (!dir_hdl->obj_ops.handle_is(dir_hdl, DIRECTORY)) {
 		LogCrit(COMPONENT_FSAL,
 			"Parent handle is not a directory. hdl = 0x%p",
 			dir_hdl);
@@ -773,7 +782,9 @@ static fsal_status_t linkfile(struct fsal_obj_handle *obj_hdl,
 	int flags = O_PATH | O_NOACCESS | O_NOFOLLOW;
 	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
 
-	if (!op_ctx->fsal_export->ops->
+	LogFullDebug(COMPONENT_FSAL, "link to %s", name);
+
+	if (!op_ctx->fsal_export->exp_ops.
 	    fs_supports(op_ctx->fsal_export, fso_link_support)) {
 		fsal_error = ERR_FSAL_NOTSUPP;
 		goto out;
@@ -790,17 +801,23 @@ static fsal_status_t linkfile(struct fsal_obj_handle *obj_hdl,
 		fsal_error = posix2fsal_error(retval);
 		goto out;
 	}
+
 	if (obj_hdl->type == REGULAR_FILE && myself->u.file.fd >= 0) {
 		srcfd = myself->u.file.fd;
 	} else {
 		srcfd = vfs_fsal_open(myself, flags, &fsal_error);
 		if (srcfd < 0) {
 			retval = -srcfd;
+			fsal_error = posix2fsal_error(retval);
+			LogDebug(COMPONENT_FSAL,
+				 "open myself returned %d", retval);
 			goto out;
 		}
 	}
+
 	destdir =
 	    container_of(destdir_hdl, struct vfs_fsal_obj_handle, obj_handle);
+
 	if (destdir_hdl->fsal != destdir_hdl->fs->fsal) {
 		LogDebug(COMPONENT_FSAL,
 			 "FSAL %s operation for handle belonging to FSAL %s, return EXDEV",
@@ -812,24 +829,33 @@ static fsal_status_t linkfile(struct fsal_obj_handle *obj_hdl,
 		fsal_error = posix2fsal_error(retval);
 		goto fileerr;
 	}
+
 	destdirfd = vfs_fsal_open(destdir, flags, &fsal_error);
+
 	if (destdirfd < 0) {
 		retval = destdirfd;
+		fsal_error = posix2fsal_error(retval);
+		LogDebug(COMPONENT_FSAL,
+			 "open destdir returned %d", retval);
 		goto fileerr;
 	}
-	retval =
-	    vfs_link_by_handle(myself->handle, srcfd, "", destdirfd, name,
-			       AT_EMPTY_PATH, &fsal_error);
+
+	retval = vfs_link_by_handle(myself->handle, srcfd, destdirfd, name);
+
 	if (retval < 0) {
 		retval = errno;
+		LogFullDebug(COMPONENT_FSAL,
+			     "link returned %d", retval);
 		fsal_error = posix2fsal_error(retval);
 	}
+
 	close(destdirfd);
 
  fileerr:
 	if (!(obj_hdl->type == REGULAR_FILE && myself->u.file.fd >= 0))
 		close(srcfd);
  out:
+	LogFullDebug(COMPONENT_FSAL, "returning %d, %d", fsal_error, retval);
 	return fsalstat(fsal_error, retval);
 }
 
@@ -920,12 +946,13 @@ static fsal_status_t read_dirents(struct fsal_obj_handle *dir_hdl,
 	return fsalstat(fsal_error, retval);
 }
 
-static fsal_status_t renamefile(struct fsal_obj_handle *olddir_hdl,
+static fsal_status_t renamefile(struct fsal_obj_handle *obj_hdl,
+				struct fsal_obj_handle *olddir_hdl,
 				const char *old_name,
 				struct fsal_obj_handle *newdir_hdl,
 				const char *new_name)
 {
-	struct vfs_fsal_obj_handle *olddir, *newdir;
+	struct vfs_fsal_obj_handle *olddir, *newdir, *obj;
 	int oldfd = -1, newfd = -1;
 	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
 	int retval = 0;
@@ -961,6 +988,7 @@ static fsal_status_t renamefile(struct fsal_obj_handle *olddir_hdl,
 		fsal_error = posix2fsal_error(retval);
 		goto out;
 	}
+	obj = container_of(obj_hdl, struct vfs_fsal_obj_handle, obj_handle);
 	newfd = vfs_fsal_open(newdir, O_PATH | O_NOACCESS, &fsal_error);
 	if (newfd < 0) {
 		retval = -newfd;
@@ -974,6 +1002,28 @@ static fsal_status_t renamefile(struct fsal_obj_handle *olddir_hdl,
 	if (retval < 0) {
 		retval = errno;
 		fsal_error = posix2fsal_error(retval);
+	} else if (vfs_unopenable_type(obj->obj_handle.type)) {
+		/* A block, char, or socket has been renamed. Fixup
+		 * our information in the handle so we can still stat it.
+		 * Save the name in case we have to sort of undo.
+		 */
+		char *saved_name = obj->u.unopenable.name;
+		memcpy(obj->u.unopenable.dir, newdir->handle,
+		       sizeof(vfs_file_handle_t));
+		obj->u.unopenable.name = gsh_strdup(new_name);
+		if (obj->u.unopenable.name != NULL) {
+			/* Discard saved_name */
+			gsh_free(saved_name);
+		} else {
+			/* It's a bad day, we're going to be messed up
+			 * no matter what we try and do, maybe leave
+			 * things not completely hosed.
+			 */
+			LogCrit(COMPONENT_FSAL,
+				"Failed to allocate memory to rename special inode from %s to %s",
+				old_name, new_name);
+			obj->u.unopenable.name = saved_name;
+		}
 	}
 	fsal_restore_ganesha_credentials();
  out:
@@ -1006,8 +1056,9 @@ static struct closefd vfs_fsal_open_and_stat(struct fsal_export *exp,
 					    O_PATH | O_NOACCESS,
 					    fsal_error);
 		if (cfd.fd < 0) {
-			LogDebug(COMPONENT_FSAL, "Failed with %s",
-				 strerror(-cfd.fd));
+			LogDebug(COMPONENT_FSAL,
+				 "Failed with %s open_flags 0x%08x",
+				 strerror(-cfd.fd), O_PATH | O_NOACCESS);
 			return cfd;
 		}
 		cfd.close_fd = true;
@@ -1022,8 +1073,9 @@ static struct closefd vfs_fsal_open_and_stat(struct fsal_export *exp,
 			/* no file open at the moment */
 			cfd.fd = vfs_fsal_open(myself, open_flags, fsal_error);
 			if (cfd.fd < 0) {
-				LogDebug(COMPONENT_FSAL, "Failed with %s",
-					 strerror(-cfd.fd));
+				LogDebug(COMPONENT_FSAL,
+					 "Failed with %s open_flags 0x%08x",
+					 strerror(-cfd.fd), open_flags);
 				return cfd;
 			}
 			cfd.close_fd = true;
@@ -1033,38 +1085,26 @@ static struct closefd vfs_fsal_open_and_stat(struct fsal_export *exp,
 		retval = fstat(cfd.fd, stat);
 		func = "fstat";
 		break;
-	case DIRECTORY:
-		cfd.fd = vfs_fsal_open(myself, open_flags, fsal_error);
-		if (cfd.fd < 0) {
-			LogDebug(COMPONENT_FSAL, "Failed with %s",
-				 strerror(-cfd.fd));
-			return cfd;
-		}
-		cfd.close_fd = true;
-		retval =
-		    vfs_stat_by_handle(cfd.fd, myself->handle, stat,
-				       open_flags);
-		func = "vfs_stat_by_handle (1)";
-		break;
 	case SYMBOLIC_LINK:
 		open_flags |= (O_PATH | O_RDWR | O_NOFOLLOW);
 		goto vfos_open;
 	case FIFO_FILE:
 		open_flags |= O_NONBLOCK;
 		/* fall through */
+	case DIRECTORY:
 	default:
  vfos_open:
 		cfd.fd = vfs_fsal_open(myself, open_flags, fsal_error);
 		if (cfd.fd < 0) {
-			LogDebug(COMPONENT_FSAL, "Failed with %s",
-				 strerror(-cfd.fd));
+			LogDebug(COMPONENT_FSAL,
+				 "Failed with %s open_flags 0x%08x",
+				 strerror(-cfd.fd), open_flags);
 			return cfd;
 		}
 		cfd.close_fd = true;
-		retval =
-		    vfs_stat_by_handle(cfd.fd, myself->handle, stat,
-				       open_flags);
-		func = "vfs_stat_by_handle (2)";
+		retval = vfs_stat_by_handle(cfd.fd, myself->handle,
+					    stat, open_flags);
+		func = "vfs_stat_by_handle";
 		break;
 	}
 
@@ -1129,7 +1169,7 @@ static fsal_status_t getattrs(struct fsal_obj_handle *obj_hdl)
 		}
 	} else {
 		LogDebug(COMPONENT_FSAL, "Failed with %s, fsal_error %s",
-			 strerror(-cfd.fd), 
+			 strerror(-cfd.fd),
 			 fsal_error ==
 			 ERR_FSAL_STALE ? "ERR_FSAL_STALE" : "other");
 		if (obj_hdl->type == SYMBOLIC_LINK
@@ -1171,7 +1211,7 @@ static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
 
 	/* apply umask, if mode attribute is to be changed */
 	if (FSAL_TEST_MASK(attrs->mask, ATTR_MODE))
-		attrs->mode &= ~op_ctx->fsal_export->ops->
+		attrs->mode &= ~op_ctx->fsal_export->exp_ops.
 			fs_umask(op_ctx->fsal_export);
 	myself = container_of(obj_hdl, struct vfs_fsal_obj_handle, obj_handle);
 	if (obj_hdl->fsal != obj_hdl->fs->fsal) {
@@ -1382,6 +1422,7 @@ static fsal_status_t file_unlink(struct fsal_obj_handle *dir_hdl,
 			fsal_error = posix2fsal_error(retval);
 		goto errout;
 	}
+	fsal_set_credentials(op_ctx->creds);
 	retval = unlinkat(fd, name, (S_ISDIR(stat.st_mode)) ? AT_REMOVEDIR : 0);
 	if (retval < 0) {
 		retval = errno;
@@ -1390,6 +1431,7 @@ static fsal_status_t file_unlink(struct fsal_obj_handle *dir_hdl,
 		else
 			fsal_error = posix2fsal_error(retval);
 	}
+	fsal_restore_ganesha_credentials();
 
  errout:
 	close(fd);
@@ -1483,7 +1525,7 @@ static void release(struct fsal_obj_handle *obj_hdl)
 		}
 	}
 
-	fsal_obj_handle_uninit(obj_hdl);
+	fsal_obj_handle_fini(obj_hdl);
 
 	if (type == SYMBOLIC_LINK) {
 		if (myself->u.symlink.link_content != NULL)
@@ -1742,6 +1784,10 @@ fsal_status_t vfs_create_handle(struct fsal_export *exp_hdl,
 	/* Test the result of stat */
 	if (retval != 0) {
 		retval = errno;
+		LogDebug(COMPONENT_FSAL,
+			 "%s failed with %s",
+			 dummy ? "stat" : "vfs_stat_by_handle",
+			 strerror(retval));
 		fsal_error = posix2fsal_error(retval);
 		if (fd >= 0)
 			close(fd);
@@ -1754,6 +1800,8 @@ fsal_status_t vfs_create_handle(struct fsal_export *exp_hdl,
 		close(fd);
 
 	if (hdl == NULL) {
+		LogDebug(COMPONENT_FSAL,
+			 "Could not allocate handle");
 		fsal_error = ERR_FSAL_NOMEM;
 		goto errout;
 	}

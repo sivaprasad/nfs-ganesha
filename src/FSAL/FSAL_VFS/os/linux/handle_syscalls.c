@@ -186,11 +186,6 @@ int vfs_map_name_to_handle_at(int fd,
 
 	kernel_fh = alloca(sizeof(struct file_handle) + VFS_MAX_HANDLE);
 
-	if (kernel_fh == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-
 	kernel_fh->handle_bytes = VFS_MAX_HANDLE;
 
 	rc = name_to_handle_at(fd, path, kernel_fh, &mnt_id, flags);
@@ -274,19 +269,21 @@ int vfs_open_by_handle(struct vfs_filesystem *vfs_fs,
 	int32_t i32;
 	int fd;
 
+	LogDebug(COMPONENT_FSAL,
+		 "vfs_fs = %s root_fd = %d",
+		 vfs_fs->fs->path, vfs_fs->root_fd);
+
 	LogVFSHandle(fh);
 
 	kernel_fh = alloca(sizeof(struct file_handle) + VFS_MAX_HANDLE);
 
-	if (kernel_fh == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-
 	switch (fh->handle_data[0] & HANDLE_TYPE_MASK) {
 	case 0:
+		LogDebug(COMPONENT_FSAL,
+			 "Invaliid handle type = 0");
 		errno = EINVAL;
-		return -1;
+		fd = -1;
+		goto out;
 	case HANDLE_TYPE_8:
 		kernel_fh->handle_type = fh->handle_data[handle_cursor];
 		handle_cursor++;
@@ -314,12 +311,14 @@ int vfs_open_by_handle(struct vfs_filesystem *vfs_fs,
 
 	fd = open_by_handle_at(vfs_fs->root_fd, kernel_fh, openflags);
 
+out:
 	if (fd < 0) {
 		fd = -errno;
 		if (fd == -ENOENT)
 			fd = -ESTALE;
 		*fsal_error = posix2fsal_error(-fd);
-		LogDebug(COMPONENT_FSAL, "Failed with %s", strerror(-fd));
+		LogDebug(COMPONENT_FSAL, "Failed with %s openflags 0x%08x",
+			 strerror(-fd), openflags);
 	}
 	return fd;
 }

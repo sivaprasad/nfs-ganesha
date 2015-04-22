@@ -32,7 +32,6 @@
 #include "config.h"
 
 #include <fcntl.h>
-#include "fsal.h"
 #include <libgen.h>		/* used for 'dirname' */
 #include <pthread.h>
 #include <string.h>
@@ -40,6 +39,7 @@
 #include <mntent.h>
 #include <sys/statfs.h>
 #include <sys/quota.h>
+#include "fsal.h"
 #include "fsal_internal.h"
 #include "fsal_convert.h"
 #include "FSAL/fsal_commonlib.h"
@@ -47,15 +47,15 @@
 #include "gpfs_methods.h"
 #include "nfs_exports.h"
 #include "export_mgr.h"
+#include "pnfs_utils.h"
 
 /* export object methods
  */
 
 static void release(struct fsal_export *exp_hdl)
 {
-	struct gpfs_fsal_export *myself;
-
-	myself = container_of(exp_hdl, struct gpfs_fsal_export, export);
+	struct gpfs_fsal_export *myself =
+	    container_of(exp_hdl, struct gpfs_fsal_export, export);
 
 	gpfs_unexport_filesystems(myself);
 	fsal_detach_export(exp_hdl->fsal, &exp_hdl->exports);
@@ -328,9 +328,9 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 		retval = errno;
 		goto err;
 	}
-	if (presquota != NULL) {
+	if (presquota != NULL)
 		return get_quota(exp_hdl, filepath, quota_type, presquota);
-	}
+
  err:
 	return fsalstat(fsal_error, retval);
 }
@@ -344,7 +344,8 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 
 static fsal_status_t gpfs_extract_handle(struct fsal_export *exp_hdl,
 					 fsal_digesttype_t in_type,
-					 struct gsh_buffdesc *fh_desc)
+					 struct gsh_buffdesc *fh_desc,
+					 int flags)
 {
 	struct gpfs_file_handle *hdl;
 	size_t fh_size = 0;
@@ -354,6 +355,26 @@ static fsal_status_t gpfs_extract_handle(struct fsal_export *exp_hdl,
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	hdl = (struct gpfs_file_handle *)fh_desc->addr;
+	if (flags & FH_FSAL_BIG_ENDIAN) {
+#if (BYTE_ORDER != BIG_ENDIAN)
+		hdl->handle_size = bswap_16(hdl->handle_size);
+		hdl->handle_type = bswap_16(hdl->handle_type);
+		hdl->handle_version = bswap_16(hdl->handle_version);
+		hdl->handle_key_size = bswap_16(hdl->handle_key_size);
+#endif
+	} else {
+#if (BYTE_ORDER == BIG_ENDIAN)
+		hdl->handle_size = bswap_16(hdl->handle_size);
+		hdl->handle_type = bswap_16(hdl->handle_type);
+		hdl->handle_version = bswap_16(hdl->handle_version);
+		hdl->handle_key_size = bswap_16(hdl->handle_key_size);
+#endif
+	}
+	LogFullDebug(COMPONENT_FSAL,
+	  "flags 0x%X size %d type %d ver %d key_size %d FSID 0x%X:%X",
+	   flags, hdl->handle_size, hdl->handle_type, hdl->handle_version,
+	   hdl->handle_key_size, hdl->handle_fsid[0], hdl->handle_fsid[1]);
+
 	fh_size = gpfs_sizeof_handle(hdl);
 	if (fh_desc->len != fh_size) {
 		LogMajor(COMPONENT_FSAL,
@@ -363,80 +384,6 @@ static fsal_status_t gpfs_extract_handle(struct fsal_export *exp_hdl,
 	}
 	fh_desc->len = hdl->handle_key_size;	/* pass back the key size */
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-/**
- * @brief Create a FSAL data server handle from a wire handle
- *
- * This function creates a FSAL data server handle from a client
- * supplied "wire" handle.  This is also where validation gets done,
- * since PUTFH is the only operation that can return
- * NFS4ERR_BADHANDLE.
- *
- * @param[in]  export_pub The export in which to create the handle
- * @param[in]  desc       Buffer from which to create the file
- * @param[out] ds_pub     FSAL data server handle
- *
- * @return NFSv4.1 error codes.
- */
-nfsstat4 gpfs_create_ds_handle(struct fsal_export * const export_pub,
-			       const struct gsh_buffdesc * const desc,
-			       struct fsal_ds_handle ** const ds_pub)
-{
-	/* Handle to be created */
-	struct gpfs_ds *ds = NULL;
-	struct fsal_filesystem *fs;
-	enum fsid_type fsid_type;
-	struct fsal_fsid__ fsid;
-	struct gpfs_file_handle *fh;
-
-	*ds_pub = NULL;
-
-	if (desc->len != sizeof(struct gpfs_file_handle))
-		return NFS4ERR_BADHANDLE;
-
-	fh = (struct gpfs_file_handle *) desc->addr;
-
-	gpfs_extract_fsid(fh, &fsid_type, &fsid);
-
-	fs = lookup_fsid(&fsid, fsid_type);
-
-	if (fs == NULL) {
-		LogInfo(COMPONENT_FSAL,
-			"Could not find filesystem for "
-			"fsid=0x%016"PRIx64".0x%016"PRIx64
-			" from handle",
-			fsid.major, fsid.minor);
-		return NFS4ERR_STALE;
-	}
-
-	if (fs->fsal != export_pub->fsal) {
-		LogInfo(COMPONENT_FSAL,
-			"Non GPFS filesystem "
-			"fsid=0x%016"PRIx64".0x%016"PRIx64
-			" from handle",
-			fsid.major, fsid.minor);
-		return NFS4ERR_STALE;
-	}
-
-	ds = gsh_calloc(1, sizeof(struct gpfs_ds));
-
-	if (ds == NULL)
-		return NFS4ERR_SERVERFAULT;
-
-	/* Connect lazily when a FILE_SYNC4 write forces us to, not
-	   here. */
-
-	ds->connected = false;
-	ds->gpfs_fs = fs->private;
-
-	memcpy(&ds->wire, desc->addr, desc->len);
-
-	fsal_ds_handle_init(&ds->ds, export_pub->ds_ops, export_pub->fsal);
-
-	*ds_pub = &ds->ds;
-
-	return NFS4_OK;
 }
 
 verifier4 GPFS_write_verifier;	/* NFS V4 write verifier */
@@ -461,7 +408,6 @@ void gpfs_export_ops_init(struct export_ops *ops)
 	ops->lookup_path = gpfs_lookup_path;
 	ops->extract_handle = gpfs_extract_handle;
 	ops->create_handle = gpfs_create_handle;
-	ops->create_ds_handle = gpfs_create_ds_handle;
 	ops->get_fs_dynamic_info = get_dynamic_info;
 	ops->fs_supports = fs_supports;
 	ops->fs_maxfilesize = fs_maxfilesize;
@@ -537,6 +483,7 @@ int open_root_fd(struct gpfs_filesystem *gpfs_fs)
 			"Could not re-index GPFS file system fsid for %s",
 			gpfs_fs->fs->path);
 		retval = -retval;
+		goto errout;
 	}
 
 	return retval;
@@ -555,6 +502,7 @@ int gpfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 	int retval;
 	struct gpfs_fsal_export *myself;
 	struct gpfs_filesystem_export_map *map = NULL;
+	pthread_attr_t attr_thr;
 
 	myself = container_of(exp, struct gpfs_fsal_export, export);
 
@@ -562,8 +510,7 @@ int gpfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 		LogInfo(COMPONENT_FSAL,
 			"Attempt to claim non-GPFS filesystem %s",
 			fs->path);
-		retval = ENXIO;
-		return 0;
+		return ENXIO;
 	}
 
 	map = gsh_calloc(1, sizeof(*map));
@@ -572,8 +519,7 @@ int gpfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 		LogCrit(COMPONENT_FSAL,
 			"Out of memory to claim file system %s",
 			fs->path);
-		retval = ENOMEM;
-		goto errout;
+		return ENOMEM;
 	}
 
 	if (fs->fsal != NULL) {
@@ -622,41 +568,33 @@ int gpfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 		goto errout;
 	}
 
-	if (gpfs_fs->up_ops == NULL) {
-		pthread_attr_t attr_thr;
+	memset(&attr_thr, 0, sizeof(attr_thr));
 
-		memset(&attr_thr, 0, sizeof(attr_thr));
+	if (pthread_attr_init(&attr_thr) != 0)
+		LogCrit(COMPONENT_THREAD, "can't init pthread's attributes");
 
-		/* Initialization of thread attributes from nfs_init.c */
-		if (pthread_attr_init(&attr_thr) != 0)
-			LogCrit(COMPONENT_THREAD,
-				"can't init pthread's attributes");
+	if (pthread_attr_setscope(&attr_thr, PTHREAD_SCOPE_SYSTEM) != 0)
+		LogCrit(COMPONENT_THREAD, "can't set pthread's scope");
 
-		if (pthread_attr_setscope(&attr_thr, PTHREAD_SCOPE_SYSTEM) != 0)
-			LogCrit(COMPONENT_THREAD, "can't set pthread's scope");
+	if (pthread_attr_setdetachstate(&attr_thr,
+					PTHREAD_CREATE_JOINABLE) != 0)
+		LogCrit(COMPONENT_THREAD, "can't set pthread's join state");
 
-		if (pthread_attr_setdetachstate(&attr_thr,
-						PTHREAD_CREATE_JOINABLE) != 0)
-			LogCrit(COMPONENT_THREAD,
-				"can't set pthread's join state");
+	if (pthread_attr_setstacksize(&attr_thr, 2116488) != 0)
+		LogCrit(COMPONENT_THREAD, "can't set pthread's stack size");
 
-		if (pthread_attr_setstacksize(&attr_thr, 2116488) != 0)
-			LogCrit(COMPONENT_THREAD,
-				"can't set pthread's stack size");
+	gpfs_fs->up_ops = exp->up_ops;
+	retval = pthread_create(&gpfs_fs->up_thread,
+				&attr_thr,
+				GPFSFSAL_UP_Thread,
+				gpfs_fs);
 
-		gpfs_fs->up_ops = exp->up_ops;
-		retval = pthread_create(&gpfs_fs->up_thread,
-					&attr_thr,
-					GPFSFSAL_UP_Thread,
-					gpfs_fs);
-
-		if (retval != 0) {
-			retval = errno;
-			LogCrit(COMPONENT_THREAD,
-				"Could not create GPFSFSAL_UP_Thread, error = %d (%s)",
-				retval, strerror(retval));
-			goto errout;
-		}
+	if (retval != 0) {
+		retval = errno;
+		LogCrit(COMPONENT_THREAD,
+			"Could not create GPFSFSAL_UP_Thread, error = %d (%s)",
+			retval, strerror(retval));
+		goto errout;
 	}
 
 	fs->private = gpfs_fs;
@@ -687,6 +625,9 @@ void gpfs_unclaim_filesystem(struct fsal_filesystem *fs)
 	struct gpfs_filesystem *gpfs_fs = fs->private;
 	struct glist_head *glist, *glistn;
 	struct gpfs_filesystem_export_map *map;
+	struct callback_arg callback;
+	int reason;
+	int rc;
 
 	if (gpfs_fs != NULL) {
 		glist_for_each_safe(glist, glistn, &gpfs_fs->exports) {
@@ -708,8 +649,19 @@ void gpfs_unclaim_filesystem(struct fsal_filesystem *fs)
 			gsh_free(map);
 		}
 
+		/* Terminate GPFS upcall thread */
+		callback.mountdirfd = gpfs_fs->root_fd;
+		reason = THREAD_STOP;
+		callback.reason = &reason;
+		rc = gpfs_ganesha(OPENHANDLE_THREAD_UPDATE, &callback);
+		if (rc)
+			LogCrit(COMPONENT_FSAL,
+				"Unable to stop upcall thread for %s, fd=%d, errno=%d",
+				fs->path, gpfs_fs->root_fd, errno);
+		else
+			LogFullDebug(COMPONENT_FSAL, "Thread STOP successful");
+		pthread_join(gpfs_fs->up_thread, NULL);
 		free_gpfs_filesystem(gpfs_fs);
-
 		fs->private = NULL;
 	}
 
@@ -757,11 +709,15 @@ void gpfs_unexport_filesystems(struct gpfs_fsal_export *exp)
 
 fsal_status_t gpfs_create_export(struct fsal_module *fsal_hdl,
 				 void *parse_node,
+				 struct config_error_type *err_type,
 				 const struct fsal_up_vector *up_ops)
 {
+	/* The status code to return */
+	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 	struct gpfs_fsal_export *myself;
-	int retval = 0;
-	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
+	struct readlink_arg varg;
+	struct gpfs_filesystem *gpfs_fs;
+	int rc;
 
 	myself = gsh_malloc(sizeof(struct gpfs_fsal_export));
 	if (myself == NULL) {
@@ -772,71 +728,123 @@ fsal_status_t gpfs_create_export(struct fsal_module *fsal_hdl,
 	memset(myself, 0, sizeof(struct gpfs_fsal_export));
 	glist_init(&myself->filesystems);
 
-	retval = fsal_internal_version();
-	LogInfo(COMPONENT_FSAL, "GPFS get version is %d options 0x%X", retval,
-		op_ctx->export->export_perms.options);
+	status.minor = fsal_internal_version();
+	LogInfo(COMPONENT_FSAL, "GPFS get version is %d options 0x%X id %d",
+		status.minor, op_ctx->export->export_perms.options,
+		op_ctx->export->export_id);
 
-	retval = fsal_export_init(&myself->export);
-	if (retval != 0) {
+	status.minor = fsal_export_init(&myself->export);
+	if (status.minor != 0) {
 		LogMajor(COMPONENT_FSAL,
 			 "out of memory for object");
 		gsh_free(myself);
-		return fsalstat(posix2fsal_error(retval), retval);
+		status.major = posix2fsal_error(status.minor);
+		return status;
 	}
-	gpfs_export_ops_init(myself->export.ops);
-	gpfs_handle_ops_init(myself->export.obj_ops);
+	gpfs_export_ops_init(&myself->export.exp_ops);
 	myself->export.up_ops = up_ops;
 
-	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);
-	if (retval != 0)
+	status.minor = fsal_attach_export(fsal_hdl, &myself->export.exports);
+	if (status.minor != 0) {
+		status.major = posix2fsal_error(status.minor);
 		goto errout;	/* seriously bad */
+	}
 	myself->export.fsal = fsal_hdl;
 
-	retval = populate_posix_file_systems();
-
-	if (retval != 0) {
+	status.minor = populate_posix_file_systems();
+	if (status.minor != 0) {
 		LogCrit(COMPONENT_FSAL,
 			"populate_posix_file_systems returned %s (%d)",
-			strerror(retval), retval);
-		fsal_error = posix2fsal_error(retval);
-		goto errout;
+			strerror(status.minor), status.minor);
+		status.major = posix2fsal_error(status.minor);
+		goto detach;
 	}
 
-	retval = claim_posix_filesystems(op_ctx->export->fullpath,
-					 fsal_hdl,
-					 &myself->export,
-					 gpfs_claim_filesystem,
-					 gpfs_unclaim_filesystem,
-					 &myself->root_fs);
-
-	if (retval != 0) {
+	status.minor = claim_posix_filesystems(op_ctx->export->fullpath,
+					       fsal_hdl, &myself->export,
+					       gpfs_claim_filesystem,
+					       gpfs_unclaim_filesystem,
+					       &myself->root_fs);
+	if (status.minor != 0) {
 		LogCrit(COMPONENT_FSAL,
 			"claim_posix_filesystems(%s) returned %s (%d)",
 			op_ctx->export->fullpath,
-			strerror(retval), retval);
-		fsal_error = posix2fsal_error(retval);
-		goto errout;
+			strerror(status.minor), status.minor);
+		status.major = posix2fsal_error(status.minor);
+		goto detach;
 	}
 
 	op_ctx->fsal_export = &myself->export;
 
 	gpfs_ganesha(OPENHANDLE_GET_VERIFIER, &GPFS_write_verifier);
+	gpfs_fs = myself->root_fs->private;
+	varg.fd = gpfs_fs->root_fd;
+	varg.buffer = (char *)&GPFS_write_verifier;
+	rc = gpfs_ganesha(OPENHANDLE_GET_VERIFIER, &varg);
+	if (rc != 0)
+		LogCrit(COMPONENT_FSAL,
+		    "OPENHANDLE_GET_VERIFIER failed with rc = %d", rc);
 
-	myself->pnfs_enabled =
-	    myself->export.ops->fs_supports(&myself->export,
-					    fso_pnfs_ds_supported);
-	if (myself->pnfs_enabled) {
-		LogInfo(COMPONENT_FSAL,
-			"gpfs_fsal_create: pnfs was enabled for [%s]",
-			op_ctx->export->fullpath);
-		export_ops_pnfs(myself->export.ops);
-		handle_ops_pnfs(myself->export.obj_ops);
-		ds_ops_init(myself->export.ds_ops);
+	/* if the nodeid has not been obtained, get it now */
+	if (!g_nodeid) {
+		struct grace_period_arg gpa;
+		int nodeid;
+
+		gpfs_fs = myself->root_fs->private;
+		gpa.mountdirfd = gpfs_fs->root_fd;
+
+		nodeid = gpfs_ganesha(OPENHANDLE_GET_NODEID, &gpa);
+		if (nodeid > 0) {
+			g_nodeid = nodeid;
+			LogFullDebug(COMPONENT_FSAL, "nodeid %d", g_nodeid);
+		} else
+			LogCrit(COMPONENT_FSAL,
+			    "OPENHANDLE_GET_NODEID failed rc %d", nodeid);
 	}
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
+	myself->pnfs_ds_enabled =
+	    myself->export.exp_ops.fs_supports(&myself->export,
+					    fso_pnfs_ds_supported);
+	myself->pnfs_mds_enabled =
+	    myself->export.exp_ops.fs_supports(&myself->export,
+					    fso_pnfs_mds_supported);
+	if (myself->pnfs_ds_enabled) {
+		struct fsal_pnfs_ds *pds = NULL;
 
- errout:
+		status = fsal_hdl->m_ops.
+			fsal_pnfs_ds(fsal_hdl, parse_node, &pds);
+		if (status.major != ERR_FSAL_NO_ERROR)
+			goto detach;
+
+		/* special case: server_id matches export_id */
+		pds->id_servers = op_ctx->export->export_id;
+		pds->mds_export = op_ctx->export;
+
+		if (!pnfs_ds_insert(pds)) {
+			LogCrit(COMPONENT_CONFIG,
+				"Server id %d already in use.",
+				pds->id_servers);
+			status.major = ERR_FSAL_EXIST;
+			fsal_pnfs_ds_fini(pds);
+			gsh_free(pds);
+			goto detach;
+		}
+
+		LogInfo(COMPONENT_FSAL,
+			"gpfs_fsal_create: pnfs ds was enabled for [%s]",
+			op_ctx->export->fullpath);
+	}
+	if (myself->pnfs_mds_enabled) {
+		LogInfo(COMPONENT_FSAL,
+			"gpfs_fsal_create: pnfs mds was enabled for [%s]",
+			op_ctx->export->fullpath);
+		export_ops_pnfs(&myself->export.exp_ops);
+	}
+	return status;
+
+detach:
+	fsal_detach_export(fsal_hdl, &myself->export.exports);
+errout:
 	free_export_ops(&myself->export);
 	gsh_free(myself);		/* elvis has left the building */
-	return fsalstat(fsal_error, retval);
+	return status;
 }

@@ -62,7 +62,7 @@ static void release(struct fsal_export *exp_hdl)
 	myself = container_of(exp_hdl, struct pseudofs_fsal_export, export);
 
 	if (myself->root_handle != NULL) {
-		fsal_obj_handle_uninit(&myself->root_handle->obj_handle);
+		fsal_obj_handle_fini(&myself->root_handle->obj_handle);
 
 		LogDebug(COMPONENT_FSAL,
 			 "Releasing hdl=%p, name=%s",
@@ -235,9 +235,12 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 
 static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
 				    fsal_digesttype_t in_type,
-				    struct gsh_buffdesc *fh_desc)
+				    struct gsh_buffdesc *fh_desc,
+				    int flags)
 {
 	size_t fh_min;
+	uint64_t *hashkey;
+	ushort *len;
 
 	fh_min = 1;
 
@@ -247,7 +250,19 @@ static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
 			 fh_min, fh_desc->len);
 		return fsalstat(ERR_FSAL_SERVERFAULT, 0);
 	}
-
+	hashkey = (uint64_t *)fh_desc->addr;
+	len = (ushort *)((char *)hashkey + sizeof(uint64_t));
+	if (flags & FH_FSAL_BIG_ENDIAN) {
+#if (BYTE_ORDER != BIG_ENDIAN)
+		*len = bswap_16(*len);
+		*hashkey = bswap_64(*hashkey);
+#endif
+	} else {
+#if (BYTE_ORDER == BIG_ENDIAN)
+		*len = bswap_16(*len);
+		*hashkey = bswap_64(*hashkey);
+#endif
+	}
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
@@ -287,6 +302,7 @@ void pseudofs_export_ops_init(struct export_ops *ops)
 
 fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 				     void *parse_node,
+				     struct config_error_type *err_type,
 				     const struct fsal_up_vector *up_ops)
 {
 	struct pseudofs_fsal_export *myself;
@@ -309,9 +325,7 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 		return fsalstat(posix2fsal_error(retval), retval);
 	}
 
-	pseudofs_export_ops_init(myself->export.ops);
-	pseudofs_handle_ops_init(myself->export.obj_ops);
-
+	pseudofs_export_ops_init(&myself->export.exp_ops);
 	myself->export.up_ops = up_ops;
 
 	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);

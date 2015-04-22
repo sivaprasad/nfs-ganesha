@@ -26,9 +26,11 @@
 #cmakedefine PROXY_HANDLE_MAPPING 1
 #cmakedefine _USE_9P 1
 #cmakedefine _USE_9P_RDMA 1
+#cmakedefine _USE_NFS_MSK 1
 #cmakedefine USE_FSAL_SHOOK 1
+#cmakedefine USE_FSAL_LUSTRE_UP 1
 #cmakedefine DEBUG_SAL 1
-#cmakedefine USE_NODELIST 1
+#cmakedefine _VALGRIND_MEMCHECK 1
 #cmakedefine _NO_MOUNT_LIST 1
 #cmakedefine HAVE_STDBOOL_H 1
 #cmakedefine HAVE_KRB5 1
@@ -48,7 +50,16 @@
 #cmakedefine HAVE_INCLUDE_LUSTREAPI_H 1
 #cmakedefine HAVE_INCLUDE_LIBLUSTREAPI_H 1
 #cmakedefine HAVE_DAEMON 1
+#cmakedefine USE_LTTNG 1
 
 #define NFS_GANESHA 1
+
+#define GANESHA_CONFIG_PATH "@SYSCONFDIR@/ganesha/ganesha.conf"
+#define GANESHA_PIDFILE_PATH "@SYSSTATEDIR@/run/ganesha.pid"
+#define NFS_V4_RECOV_ROOT "@SYSSTATEDIR@/lib/nfs/ganesha"
+/**
+ * @brief Default value for krb5_param.ccache_dir
+ */
+#define DEFAULT_NFS_CCACHE_DIR "@SYSSTATEDIR@/run/ganesha"
 
 #endif /* CONFIG_H */

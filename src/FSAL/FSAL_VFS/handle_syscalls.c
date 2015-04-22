@@ -42,7 +42,6 @@
 #include "FSAL/fsal_commonlib.h"
 #include "vfs_methods.h"
 #include <os/subr.h>
-#include "pnfs_panfs/mds.h"
 
 int vfs_readlink(struct vfs_fsal_obj_handle *myself,
 		 fsal_errors_t *fsal_error)
@@ -130,49 +129,7 @@ int vfs_get_root_handle(struct vfs_filesystem *vfs_fs,
 			vfs_fs->fs->fsid.minor);
 	}
 
-	if (retval != 0) {
-		retval = errno;
-		LogMajor(COMPONENT_FSAL,
-			 "Get root handle for %s failed with %s (%d)",
-			 vfs_fs->fs->path, strerror(retval), retval);
-	} else {
-		/* May reindex for some platforms */
-		retval = vfs_re_index(vfs_fs, exp);
-	}
-
-	return retval;
+	/* May reindex for some platforms */
+	return vfs_re_index(vfs_fs, exp);
 }
 
-void vfs_fini(struct vfs_fsal_export *myself)
-{
-	pnfs_panfs_fini(myself->pnfs_data);
-}
-
-void vfs_init_export_ops(struct vfs_fsal_export *myself,
-			 const char *export_path)
-{
-	if (myself->pnfs_panfs_enabled) {
-		LogInfo(COMPONENT_FSAL,
-			"pnfs_panfs was enabled for [%s]",
-			export_path);
-		export_ops_pnfs(myself->export.ops);
-		handle_ops_pnfs(myself->export.obj_ops);
-	}
-}
-
-int vfs_init_export_pnfs(struct vfs_fsal_export *myself)
-{
-	int retval = 0;
-
-	if (myself->pnfs_panfs_enabled) {
-		retval = pnfs_panfs_init(vfs_get_root_fd(&myself->export),
-							 &myself->pnfs_data);
-		if (retval) {
-			LogCrit(COMPONENT_FSAL,
-				"vfs export_ops_pnfs failed => %d [%s]",
-				retval, strerror(retval));
-		}
-	}
-
-	return retval;
-}

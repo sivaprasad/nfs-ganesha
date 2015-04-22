@@ -16,7 +16,7 @@
  *
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  *
  * -------------
  */
@@ -40,6 +40,7 @@
 #include "gluster_internal.h"
 #include "nfs_exports.h"
 #include "export_mgr.h"
+#include "pnfs_utils.h"
 
 /**
  * @brief Implements GLUSTER FSAL exportoperation release
@@ -56,7 +57,6 @@ static void export_release(struct fsal_export *exp_hdl)
 	fsal_detach_export(glfs_export->export.fsal,
 			   &glfs_export->export.exports);
 	free_export_ops(&glfs_export->export);
-	glfs_export->export.ops = NULL;
 
 	/* Gluster and memory cleanup */
 	glfs_fini(glfs_export->gl_fs);
@@ -90,35 +90,38 @@ static fsal_status_t lookup_path(struct fsal_export *export_pub,
 
 	*pub_handle = NULL;
 
-        if (strcmp(path, glfs_export->mount_path) == 0) {
-	        realpath = strdup(glfs_export->export_path);
-        } else {
-                /*
-                 *  mount path is not same as the exported one. Should be subdir
-                 *  then.
-                 *  TODO: How do we handle symlinks if present in the path.
-                 */
-                realpath = malloc(strlen(glfs_export->export_path)+ strlen(path) + 1);
-                if (realpath) {
-                        /*
-                         * Handle the case wherein glfs_export->export_path
-                         * is root i.e, '/' separately.
-                         */
-                        if (strlen(glfs_export->export_path) != 1) {
-                                strcpy(realpath, glfs_export->export_path);
-                                strcpy(realpath+strlen(glfs_export->export_path),
-                                        &path[strlen(glfs_export->mount_path)]);
-                        } else {
-                                strcpy(realpath, &path[strlen(glfs_export->mount_path)]);
-                        }
-                }
-        }
-        if (!realpath) {
-                errno = ENOMEM;
-	        status = gluster2fsal_error(errno);
-       		goto out;
-        }
-                
+	if (strcmp(path, glfs_export->mount_path) == 0) {
+		realpath = strdup(glfs_export->export_path);
+	} else {
+		/*
+		 *  mount path is not same as the exported one. Should be subdir
+		 *  then.
+		 *  TODO: How do we handle symlinks if present in the path.
+		 */
+		realpath = gsh_malloc(strlen(glfs_export->export_path) +
+				      strlen(path) + 1);
+		if (realpath) {
+			/*
+			 * Handle the case wherein glfs_export->export_path
+			 * is root i.e, '/' separately.
+			 */
+			if (strlen(glfs_export->export_path) != 1) {
+				strcpy(realpath, glfs_export->export_path);
+				strcpy((realpath +
+					strlen(glfs_export->export_path)),
+					&path[strlen(glfs_export->mount_path)]);
+			} else {
+				strcpy(realpath,
+					&path[strlen(glfs_export->mount_path)]);
+			}
+		}
+	}
+	if (!realpath) {
+		errno = ENOMEM;
+		status = gluster2fsal_error(errno);
+		goto out;
+	}
+
 	glhandle = glfs_h_lookupat(glfs_export->gl_fs, NULL, realpath, &sb);
 	if (glhandle == NULL) {
 		status = gluster2fsal_error(errno);
@@ -146,15 +149,14 @@ static fsal_status_t lookup_path(struct fsal_export *export_pub,
 
 	*pub_handle = &objhandle->handle;
 
-        if (realpath) {
-                free(realpath);
-        }
+	if (realpath)
+		free(realpath);
+
 	return status;
  out:
 	gluster_cleanup_vars(glhandle);
-        if (realpath) {
-                free(realpath);
-        }
+	if (realpath)
+		free(realpath);
 
 	return status;
 }
@@ -165,7 +167,8 @@ static fsal_status_t lookup_path(struct fsal_export *export_pub,
 
 static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
 				    fsal_digesttype_t in_type,
-				    struct gsh_buffdesc *fh_desc)
+				    struct gsh_buffdesc *fh_desc,
+				    int flags)
 {
 	size_t fh_size;
 #ifdef GLTIMING
@@ -252,9 +255,8 @@ static fsal_status_t create_handle(struct fsal_export *export_pub,
 
 	*pub_handle = &objhandle->handle;
  out:
-	if (status.major != ERR_FSAL_NO_ERROR) {
+	if (status.major != ERR_FSAL_NO_ERROR)
 		gluster_cleanup_vars(glhandle);
-	}
 #ifdef GLTIMING
 	now(&e_time);
 	latency_update(&s_time, &e_time, lat_create_handle);
@@ -268,7 +270,7 @@ static fsal_status_t create_handle(struct fsal_export *export_pub,
 
 static fsal_status_t get_dynamic_info(struct fsal_export *exp_hdl,
 				      struct fsal_obj_handle *obj_hdl,
-				      fsal_dynamicfsinfo_t * infop)
+				      fsal_dynamicfsinfo_t *infop)
 {
 	int rc = 0;
 	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
@@ -277,9 +279,8 @@ static fsal_status_t get_dynamic_info(struct fsal_export *exp_hdl,
 	    container_of(exp_hdl, struct glusterfs_export, export);
 
 	rc = glfs_statvfs(glfs_export->gl_fs, glfs_export->export_path, &vfssb);
-	if (rc != 0) {
+	if (rc != 0)
 		return gluster2fsal_error(rc);
-	}
 
 	memset(infop, 0, sizeof(fsal_dynamicfsinfo_t));
 	infop->total_bytes = vfssb.f_frsize * vfssb.f_blocks;
@@ -512,8 +513,6 @@ void export_ops_init(struct export_ops *ops)
 	ops->fs_xattr_access_rights = fs_xattr_access_rights;
 }
 
-void handle_ops_init(struct fsal_obj_ops *ops);
-
 struct glexport_params {
 	char *glvolname;
 	char *glhostname;
@@ -550,9 +549,9 @@ static struct config_block export_param = {
 
 fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 				      void *parse_node,
+				      struct config_error_type *err_type,
 				      const struct fsal_up_vector *up_ops)
 {
-	struct config_error_type err_type;
 	int rc;
 	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 	struct glusterfs_export *glfsexport = NULL;
@@ -570,7 +569,7 @@ fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 				   &export_param,
 				   &params,
 				   true,
-				   &err_type);
+				   err_type);
 	if (rc != 0) {
 		LogCrit(COMPONENT_FSAL,
 			"Incorrect or missing parameters for export %s",
@@ -598,8 +597,7 @@ fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 		goto out;
 	}
 
-	export_ops_init(glfsexport->export.ops);
-	handle_ops_init(glfsexport->export.obj_ops);
+	export_ops_init(&glfsexport->export.exp_ops);
 	glfsexport->export.up_ops = up_ops;
 
 	fs = glfs_new(params.glvolname);
@@ -638,8 +636,8 @@ fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 		goto out;
 	}
 
-	if ((rc =
-	     fsal_attach_export(fsal_hdl, &glfsexport->export.exports)) != 0) {
+	rc = fsal_attach_export(fsal_hdl, &glfsexport->export.exports);
+	if (rc != 0) {
 		status.major = ERR_FSAL_SERVERFAULT;
 		LogCrit(COMPONENT_FSAL, "Unable to attach export. Export: %s",
 			op_ctx->export->fullpath);
@@ -658,6 +656,45 @@ fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 
 	op_ctx->fsal_export = &glfsexport->export;
 
+	glfsexport->pnfs_ds_enabled =
+		glfsexport->export.exp_ops.fs_supports(&glfsexport->export,
+						fso_pnfs_ds_supported);
+	if (glfsexport->pnfs_ds_enabled) {
+		struct fsal_pnfs_ds *pds = NULL;
+
+		status = fsal_hdl->m_ops.
+				fsal_pnfs_ds(fsal_hdl, parse_node, &pds);
+		if (status.major != ERR_FSAL_NO_ERROR)
+			goto out;
+
+		/* special case: server_id matches export_id */
+		pds->id_servers = op_ctx->export->export_id;
+		pds->mds_export = op_ctx->export;
+
+		if (!pnfs_ds_insert(pds)) {
+			LogCrit(COMPONENT_CONFIG,
+				"Server id %d already in use.",
+				pds->id_servers);
+			status.major = ERR_FSAL_EXIST;
+			goto out;
+		}
+
+		LogDebug(COMPONENT_PNFS,
+			 "glusterfs_fsal_create: pnfs ds was enabled for [%s]",
+			 op_ctx->export->fullpath);
+	}
+
+	glfsexport->pnfs_mds_enabled =
+		glfsexport->export.exp_ops.fs_supports(&glfsexport->export,
+						fso_pnfs_mds_supported);
+	if (glfsexport->pnfs_mds_enabled) {
+		LogDebug(COMPONENT_PNFS,
+			 "glusterfs_fsal_create: pnfs mds was enabled for [%s]",
+			 op_ctx->export->fullpath);
+		export_ops_pnfs(&glfsexport->export.exp_ops);
+		fsal_ops_pnfs(&glfsexport->export.fsal->m_ops);
+	}
+
  out:
 	if (params.glvolname)
 		gsh_free(params.glvolname);
@@ -665,7 +702,7 @@ fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 		gsh_free(params.glhostname);
 	if (params.glfs_log)
 		gsh_free(params.glfs_log);
-	
+
 	if (status.major != ERR_FSAL_NO_ERROR) {
 		if (params.glvolpath)
 			gsh_free(params.glvolpath);

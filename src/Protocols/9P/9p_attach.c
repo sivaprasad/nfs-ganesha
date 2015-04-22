@@ -43,6 +43,7 @@
 #include "cache_inode.h"
 #include "cache_inode_lru.h"
 #include "fsal.h"
+#include "nfs_exports.h"
 #include "9p.h"
 
 int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
@@ -64,9 +65,13 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 
 	struct _9p_fid *pfid = NULL;
 
-	struct gsh_export *export;
+	struct gsh_export *export = NULL;
 	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 	char exppath[MAXPATHLEN];
+	cache_inode_fsal_data_t fsal_data;
+	struct fsal_obj_handle *pfsal_handle;
+	int port;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -80,6 +85,11 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 		 "TATTACH: tag=%u fid=%u afid=%d uname='%.*s' aname='%.*s' n_uname=%d",
 		 (u32) *msgtag, *fid, *afid, (int) *uname_len, uname_str,
 		 (int) *aname_len, aname_str, *n_uname);
+
+	if (*fid >= _9P_FID_PER_CONN) {
+		err = ERANGE;
+		goto errout;
+	}
 
 	/*
 	 * Find the export for the aname (using as well Path or Tag)
@@ -97,8 +107,13 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 		goto errout;
 	}
 
-	if (*fid >= _9P_FID_PER_CONN) {
-		err = ERANGE;
+	port = get_port(&req9p->pconn->addrpeer);
+	if (export->export_perms.options & EXPORT_OPTION_PRIVILEGED_PORT &&
+	    port >= IPPORT_RESERVED) {
+		LogInfo(COMPONENT_9P,
+			"Port %d is too high for this export entry, rejecting client",
+			port);
+		err = EACCES;
 		goto errout;
 	}
 
@@ -134,22 +149,49 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 		goto errout;
 	}
 
-	/* Check if root cache entry is correctly set, fetch it, and
-	 * take an LRU reference.
-	 */
-	cache_status = nfs_export_get_root_entry(export, &pfid->pentry);
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		err = _9p_tools_errno(cache_status);
-		goto errout;
-	}
-
 	/* Keep track of the export in the req_ctx */
 	pfid->op_context.export = export;
 	pfid->op_context.fsal_export = export->fsal_export;
+	pfid->op_context.caller_addr = &req9p->pconn->addrpeer;
+	pfid->op_context.export_perms = &req9p->pconn->export_perms;
 
 	op_ctx =  &pfid->op_context;
+	export_check_access();
+
+	if (exppath[0] != '/' ||
+	    !strcmp(exppath, export->fullpath)) {
+		/* Check if root cache entry is correctly set, fetch it, and
+		 * take an LRU reference.
+		 */
+		cache_status = nfs_export_get_root_entry(export, &pfid->pentry);
+		if (cache_status != CACHE_INODE_SUCCESS) {
+			err = _9p_tools_errno(cache_status);
+			goto errout;
+		}
+	} else {
+		fsal_status = op_ctx->fsal_export->exp_ops.lookup_path(
+						op_ctx->fsal_export,
+						exppath,
+						&pfsal_handle);
+		if (FSAL_IS_ERROR(fsal_status)) {
+			err = _9p_tools_errno(
+				cache_inode_error_convert(fsal_status));
+			goto errout;
+		}
+
+		pfsal_handle->obj_ops.handle_to_key(pfsal_handle,
+						 &fsal_data.fh_desc);
+		fsal_data.export = export->fsal_export;
+
+		cache_status = cache_inode_get(&fsal_data, &pfid->pentry);
+		if (cache_status != CACHE_INODE_SUCCESS) {
+			err = _9p_tools_errno(cache_status);
+			goto errout;
+		}
+	}
+
 	/* This fid is a special one: it comes from TATTACH */
-	pfid->from_attach = TRUE;
+	pfid->from_attach = true;
 
 	cache_status = cache_inode_fileid(pfid->pentry, &fileid);
 	if (cache_status != CACHE_INODE_SUCCESS) {
@@ -183,6 +225,7 @@ errout:
 
 	if (export != NULL)
 		put_gsh_export(export);
+
 	if (pfid != NULL) {
 		if (pfid->pentry != NULL)
 			cache_inode_put(pfid->pentry);
@@ -190,5 +233,4 @@ errout:
 	}
 
 	return _9p_rerror(req9p, worker_data, msgtag, err, plenout, preply);
-
 }
